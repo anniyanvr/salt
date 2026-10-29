@@ -1,4 +1,6 @@
 import pytest
+from pytestskipmarkers.utils import platform
+
 import salt.modules.postgres as postgres
 import salt.states.postgres_group as postgres_group
 from tests.support.mock import create_autospec, patch
@@ -18,6 +20,8 @@ def fixture_db_args():
 
 @pytest.fixture(name="md5_pw")
 def fixture_md5_pw():
+    if platform.is_fips_enabled():
+        pytest.skip("Test cannot run on a FIPS enabled platform")
     # 'md5' + md5('password' + 'groupname')
     return "md58b14c378fab8ef0dc227f4e6d6787a87"
 
@@ -46,8 +50,8 @@ def fixture_test_mode():
         yield
 
 
-@pytest.fixture(name="mocks")
-def fixture_mocks():
+@pytest.fixture
+def mocks():
     return {
         "postgres.role_get": create_autospec(postgres.role_get, return_value=None),
         "postgres.user_exists": create_autospec(
@@ -65,14 +69,12 @@ def fixture_mocks():
     }
 
 
-@pytest.fixture(autouse=True)
-def setup_loader(mocks):
-    setup_loader_modules = {
+@pytest.fixture
+def configure_loader_modules(mocks):
+    return {
         postgres_group: {"__opts__": {"test": False}, "__salt__": mocks},
         postgres: {"__opts__": {"test": False}},
     }
-    with pytest.helpers.loader_mock(setup_loader_modules) as loader_mock:
-        yield loader_mock
 
 
 # ==========
@@ -80,6 +82,7 @@ def setup_loader(mocks):
 # ==========
 
 
+@pytest.mark.skip_on_fips_enabled_platform
 def test_present_create_basic(mocks, db_args):
     assert postgres_group.present("groupname") == {
         "name": "groupname",
@@ -101,7 +104,7 @@ def test_present_create_basic(mocks, db_args):
         replication=None,
         rolepassword=None,
         groups=None,
-        **db_args
+        **db_args,
     )
     mocks["postgres.group_update"].assert_not_called()
 
@@ -176,7 +179,7 @@ def test_present_change_option(mocks, existing_group, db_args):
         replication=True,
         rolepassword=None,
         groups=None,
-        **db_args
+        **db_args,
     )
 
 
@@ -199,7 +202,7 @@ def test_present_create_md5_password(mocks, md5_pw, db_args):
         replication=None,
         rolepassword=md5_pw,
         groups=None,
-        **db_args
+        **db_args,
     )
     mocks["postgres.group_update"].assert_not_called()
 
@@ -225,7 +228,7 @@ def test_present_create_plain_password(mocks, db_args):
         replication=None,
         rolepassword="password",
         groups=None,
-        **db_args
+        **db_args,
     )
     mocks["postgres.group_update"].assert_not_called()
 
@@ -258,7 +261,7 @@ def test_present_create_md5_password_default_encrypted(
         replication=None,
         rolepassword=md5_pw,
         groups=None,
-        **db_args
+        **db_args,
     )
     mocks["postgres.group_update"].assert_not_called()
 
@@ -282,7 +285,7 @@ def test_present_create_md5_prehashed(mocks, md5_pw, db_args):
         replication=None,
         rolepassword=md5_pw,
         groups=None,
-        **db_args
+        **db_args,
     )
     mocks["postgres.group_update"].assert_not_called()
 
@@ -340,10 +343,11 @@ def test_present_update_md5_password(mocks, existing_group, md5_pw, db_args):
         replication=None,
         rolepassword=md5_pw,
         groups=None,
-        **db_args
+        **db_args,
     )
 
 
+@pytest.mark.skip_on_fips_enabled_platform
 def test_present_update_error(mocks, existing_group):
     existing_group["password"] = "md500000000000000000000000000000000"
     mocks["postgres.role_get"].return_value = existing_group
@@ -386,7 +390,7 @@ def test_present_update_password_no_check(mocks, existing_group, md5_pw, db_args
         replication=None,
         rolepassword=md5_pw,
         groups=None,
-        **db_args
+        **db_args,
     )
 
 

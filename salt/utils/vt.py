@@ -14,7 +14,7 @@
     get us into.
 
     .. __: http://code.activestate.com/recipes/440554/
-    .. __: https://github.com/python-mirror/python/blob/3.3/Lib/pty.py
+    .. __: https://github.com/python/cpython/blob/3.3/Lib/pty.py
     .. __: https://github.com/pexpect/pexpect
 
 """
@@ -32,23 +32,24 @@ import time
 import salt.utils.crypt
 import salt.utils.data
 import salt.utils.stringutils
-from salt.log.setup import LOG_LEVELS
+from salt._logging import LOG_LEVELS
 
 mswindows = sys.platform == "win32"
 
 try:
     # pylint: disable=F0401,W0611
-    from win32file import ReadFile, WriteFile
-    from win32pipe import PeekNamedPipe
     import msvcrt
+
     import win32api
     import win32con
     import win32process
+    from win32file import ReadFile, WriteFile
+    from win32pipe import PeekNamedPipe
 
     # pylint: enable=F0401,W0611
 except ImportError:
-    import pty
     import fcntl
+    import pty
     import struct
     import termios
 
@@ -72,13 +73,19 @@ def setwinsize(child, rows=80, cols=80):
 
     Thank you for the shortcut PEXPECT
     """
-    TIOCSWINSZ = getattr(termios, "TIOCSWINSZ", -2146929561)
-    if TIOCSWINSZ == 2148037735:
-        # Same bits, but with sign.
-        TIOCSWINSZ = -2146929561
+    # pylint: disable=used-before-assignment
     # Note, assume ws_xpixel and ws_ypixel are zero.
+    #
+    # Historical note: this used to fall back to a negative literal
+    # (-2146929561) when ``termios.TIOCSWINSZ`` compared equal to the
+    # unsigned macOS value 2148037735, working around an old CPython
+    # signed-cast quirk in ``fcntl.ioctl``. Python 3.14 rejects negative
+    # ``request`` values outright (Errno 25 "Inappropriate ioctl for
+    # device"), which broke salt-ssh on the 3008.x macOS onedir. The
+    # ``termios`` constant is authoritative on every supported platform,
+    # so pass it through unchanged.
     packed = struct.pack(b"HHHH", rows, cols, 0, 0)
-    fcntl.ioctl(child, TIOCSWINSZ, packed)
+    fcntl.ioctl(child, termios.TIOCSWINSZ, packed)
 
 
 def getwinsize(child):
@@ -88,9 +95,9 @@ def getwinsize(child):
 
     Thank you for the shortcut PEXPECT
     """
-    TIOCGWINSZ = getattr(termios, "TIOCGWINSZ", 1074295912)
+    # pylint: disable=used-before-assignment
     packed = struct.pack(b"HHHH", 0, 0, 0, 0)
-    ioctl = fcntl.ioctl(child, TIOCGWINSZ, packed)
+    ioctl = fcntl.ioctl(child, termios.TIOCGWINSZ, packed)
     return struct.unpack(b"HHHH", ioctl)[0:2]
 
 
@@ -117,6 +124,7 @@ class Terminal:
         log_stdout_level="debug",
         log_stderr=None,
         log_stderr_level="debug",
+        log_sanitize=None,
         # sys.stdXYZ streaming options
         stream_stdout=None,
         stream_stderr=None,
@@ -213,7 +221,7 @@ class Terminal:
             log.warning(
                 "Failed to spawn the VT: %s", err, exc_info_on_loglevel=logging.DEBUG
             )
-            raise TerminalException("Failed to spawn the VT. Error: {}".format(err))
+            raise TerminalException(f"Failed to spawn the VT. Error: {err}")
 
         log.debug(
             "Child Forked! PID: %s  STDOUT_FD: %s  STDERR_FD: %s",
@@ -221,7 +229,16 @@ class Terminal:
             self.child_fd,
             self.child_fde,
         )
+        if log_sanitize:
+            if not isinstance(log_sanitize, str):
+                raise RuntimeError("'log_sanitize' needs to be a str type")
+            self.log_sanitize = log_sanitize
+        else:
+            self.log_sanitize = None
+
         terminal_command = " ".join(self.args)
+        if self.log_sanitize:
+            terminal_command = terminal_command.replace(self.log_sanitize, ("*" * 6))
         if (
             'decode("base64")' in terminal_command
             or "base64.b64decode(" in terminal_command
@@ -235,7 +252,7 @@ class Terminal:
         self.stdin_logger_level = LOG_LEVELS.get(log_stdin_level, log_stdin_level)
         if log_stdin is True:
             self.stdin_logger = logging.getLogger(
-                "{}.{}.PID-{}.STDIN".format(__name__, self.__class__.__name__, self.pid)
+                f"{__name__}.{self.__class__.__name__}.PID-{self.pid}.STDIN"
             )
         elif log_stdin is not None:
             if not isinstance(log_stdin, logging.Logger):
@@ -283,7 +300,7 @@ class Terminal:
         """
         Send the provided data to the terminal appending a line feed.
         """
-        return self.send("{}{}".format(data, linesep))
+        return self.send(f"{data}{linesep}")
 
     def recv(self, maxsize=None):
         """
@@ -362,7 +379,7 @@ class Terminal:
             elif sig == signal.CTRL_BREAK_EVENT:
                 os.kill(self.pid, signal.CTRL_BREAK_EVENT)
             else:
-                raise ValueError("Unsupported signal: {}".format(sig))
+                raise ValueError(f"Unsupported signal: {sig}")
             # pylint: enable=E1101
 
         def terminate(self, force=False):
@@ -385,7 +402,7 @@ class Terminal:
         def _spawn(self):
             if not isinstance(self.args, str) and self.shell is True:
                 self.args = " ".join(self.args)
-            parent, child = pty.openpty()
+            parent, child = pty.openpty()  # pylint: disable=used-before-assignment
             err_parent, err_child = os.pipe()
             child_name = os.ttyname(child)
             proc = subprocess.Popen(  # pylint: disable=subprocess-popen-preexec-fn
@@ -407,6 +424,7 @@ class Terminal:
             self.child_fd = parent
             self.child_fde = err_parent
             self.pid = proc.pid
+            self.proc = proc
             self.closed = False
             self.terminated = False
 
@@ -430,9 +448,7 @@ class Terminal:
                 tty_fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
                 if tty_fd >= 0:
                     os.close(tty_fd)
-                    raise TerminalException(
-                        "Could not open child pty, {}".format(child_name)
-                    )
+                    raise TerminalException(f"Could not open child pty, {child_name}")
             # which exception, shouldn't we catch explicitly .. ?
             except Exception:  # pylint: disable=broad-except
                 # Good! We are disconnected from a controlling tty.
@@ -440,9 +456,7 @@ class Terminal:
             tty_fd = os.open(child_name, os.O_RDWR)
             setwinsize(tty_fd, rows, cols)
             if tty_fd < 0:
-                raise TerminalException(
-                    "Could not open child pty, {}".format(child_name)
-                )
+                raise TerminalException(f"Could not open child pty, {child_name}")
             else:
                 os.close(tty_fd)
             if os.name != "posix":
@@ -451,8 +465,6 @@ class Terminal:
                     raise TerminalException("Could not open controlling tty, /dev/tty")
                 else:
                     os.close(tty_fd)
-
-            salt.utils.crypt.reinit_crypto()
 
             if preexec_fn is not None:
                 preexec_fn()
@@ -578,6 +590,10 @@ class Terminal:
 
                         if self.stderr_logger:
                             stripped = stderr.rstrip()
+                            if self.log_sanitize:
+                                stripped = stripped.replace(
+                                    self.log_sanitize, ("*" * 6)
+                                )
                             if stripped.startswith(os.linesep):
                                 stripped = stripped[len(os.linesep) :]
                             if stripped:
@@ -611,6 +627,10 @@ class Terminal:
 
                         if self.stdout_logger:
                             stripped = stdout.rstrip()
+                            if self.log_sanitize:
+                                stripped = stripped.replace(
+                                    self.log_sanitize, ("*" * 6)
+                                )
                             if stripped.startswith(os.linesep):
                                 stripped = stripped[len(os.linesep) :]
                             if stripped:
@@ -692,6 +712,14 @@ class Terminal:
 
             try:
                 pid, status = _waitpid(self.pid, waitpid_options)
+            except ChildProcessError:
+                # check if process is really dead or if it is just pretending and we should exit normally through the gift center
+                polled = self.proc.poll()
+                if polled is None:
+                    return True
+                # process must have returned on it's own process the return code
+                pid = self.pid
+                status = polled
             except _os_error:
                 err = sys.exc_info()[1]
                 # No child processes

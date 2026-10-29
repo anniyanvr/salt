@@ -6,13 +6,16 @@ user present with custom homedir
 """
 
 import pathlib
+import random
 import shutil
 import sys
 
 import pytest
-import salt.utils.files
-import salt.utils.platform
 from saltfactories.utils import random_string
+
+import salt.utils.files
+import salt.utils.path
+import salt.utils.platform
 
 try:
     import grp
@@ -43,6 +46,11 @@ def username(sminion):
 
 
 @pytest.fixture
+def guid():
+    return random.randint(60000, 61000)
+
+
+@pytest.fixture
 def user_home(username, tmp_path):
     if salt.utils.platform.is_windows():
         return tmp_path / username
@@ -51,10 +59,14 @@ def user_home(username, tmp_path):
 
 
 @pytest.fixture
-def group_1(username):
+def group_1(username, grains):
     groupname = username
     if salt.utils.platform.is_darwin():
         groupname = "staff"
+    elif salt.utils.platform.is_photonos():
+        groupname = "users"
+    elif grains["os_family"] in ("Suse",):
+        groupname = "users"
     with pytest.helpers.create_group(name=groupname) as group:
         yield group
 
@@ -71,6 +83,7 @@ def existing_account():
         yield _account
 
 
+@pytest.mark.slow_test
 def test_user_absent(states):
     """
     Test user.absent with a non existing account
@@ -109,7 +122,8 @@ def test_user_present_when_home_dir_does_not_18843(states, existing_account):
     """
     shutil.rmtree(existing_account.info.home)
     ret = states.user.present(
-        name=existing_account.username, home=existing_account.info.home
+        name=existing_account.username,
+        home=existing_account.info.home,
     )
     assert ret.result is True
     assert pathlib.Path(existing_account.info.home).is_dir()
@@ -130,12 +144,16 @@ def test_user_present_nondefault(grains, modules, states, username, user_home):
     if not salt.utils.platform.is_darwin() and not salt.utils.platform.is_windows():
         assert user_home.is_dir()
 
-    if grains["os_family"] in ("Suse",):
+    if grains["os_family"] == "Suse" and not (
+        grains.get("transactional", False) or grains.get("osmajorrelease", 0) >= 16
+    ):
         expected_group_name = "users"
     elif grains["os_family"] == "MacOS":
         expected_group_name = "staff"
     elif salt.utils.platform.is_windows():
         expected_group_name = []
+    elif grains["os"] == "VMware Photon OS":
+        expected_group_name = "users"
     else:
         expected_group_name = username
     assert group_name == expected_group_name
@@ -181,13 +199,21 @@ def test_user_present_usergroup_true(modules, states, username, user_home, group
     assert group_name == group_1.name
 
 
+def _check_skip(grains):
+    if grains["os"] == "MacOS":
+        return True
+    return False
+
+
 @pytest.mark.skipif(
     ANSI_FILESYSTEM_ENCODING,
     reason=(
-        "A system encoding which supports Unicode characters must be set. Current setting is: {}. "
-        "Try setting $LANG='en_US.UTF-8'".format(ANSI_FILESYSTEM_ENCODING)
+        "A system encoding which supports Unicode characters must be set. "
+        f"Current setting is: {sys.getfilesystemencoding()}. "
+        "Try setting $LANG='en_US.UTF-8'"
     ),
 )
+@pytest.mark.skip_initial_gh_actions_failure(skip=_check_skip)
 def test_user_present_unicode(states, username, subtests):
     """
     It ensures that unicode GECOS data will be properly handled, without
@@ -291,6 +317,27 @@ def test_user_present_home_directory_created(modules, states, username, createho
     assert pathlib.Path(user_info["home"]).is_dir() is createhome
 
 
+@pytest.mark.skip_on_windows(reason="windows minion does not support persist_home")
+@pytest.mark.skip_on_darwin(reason="Mac minion does not support persist_home")
+@pytest.mark.parametrize("persist_home", [True, False])
+def test_user_present_home_directory_persisted(
+    modules, states, existing_account, user_home, persist_home
+):
+    """
+    It ensures that the home directory is persisted when home changed.
+    """
+    pathlib.Path(existing_account.info.home, "testfile").touch()
+    ret = states.user.present(
+        name=existing_account.username, home=str(user_home), persist_home=persist_home
+    )
+    assert ret.result is True
+
+    user_info = modules.user.info(existing_account.info.name)
+    assert user_info
+
+    assert pathlib.Path(user_info["home"], "testfile").is_file() is persist_home
+
+
 @pytest.mark.skip_on_darwin(reason="groups/gid not fully supported")
 @pytest.mark.skip_on_windows(reason="groups/gid not fully supported")
 def test_user_present_change_gid_but_keep_group(
@@ -331,7 +378,7 @@ def test_user_present_change_gid_but_keep_group(
 
 @pytest.mark.skip_unless_on_windows
 def test_user_present_existing(states, username):
-    win_profile = "C:\\User\\{}".format(username)
+    win_profile = f"C:\\User\\{username}"
     win_logonscript = "C:\\logon.vbs"
     win_description = "Test User Account"
     ret = states.user.present(
@@ -343,7 +390,7 @@ def test_user_present_existing(states, username):
     )
     assert ret.result is True
 
-    win_profile = "C:\\Users\\{}".format(username)
+    win_profile = f"C:\\Users\\{username}"
     win_description = "Temporary Account"
     ret = states.user.present(
         name=username,
@@ -360,3 +407,206 @@ def test_user_present_existing(states, username):
     assert ret.changes["profile"] == win_profile
     assert "description" in ret.changes
     assert ret.changes["description"] == win_description
+
+
+@pytest.mark.skip_unless_on_linux(reason="underlying functionality only runs on Linux")
+def test_user_present_change_groups(
+    grains, modules, states, username, group_1, group_2
+):
+    expected_groups = [group_2.name, group_1.name]
+    if grains["os_family"] == "Suse" and (
+        grains.get("transactional", False) or grains.get("osmajorrelease", 0) >= 16
+    ):
+        expected_groups.append(username)
+
+    ret = states.user.present(
+        name=username,
+        groups=[group_1.name, group_2.name],
+    )
+    assert ret.result is True
+
+    user_info = modules.user.info(username)
+    assert user_info
+    assert sorted(user_info["groups"]) == sorted(expected_groups)
+
+    expected_groups.remove(group_2.name)
+
+    # run again and remove group_2
+    ret = states.user.present(
+        name=username,
+        groups=[group_1.name],
+    )
+    assert ret.result is True
+
+    user_info = modules.user.info(username)
+    assert user_info
+    assert sorted(user_info["groups"]) == sorted(expected_groups)
+
+
+@pytest.mark.skip_unless_on_linux(reason="underlying functionality only runs on Linux")
+def test_user_present_change_optional_groups(
+    grains, modules, states, username, group_1, group_2
+):
+    expected_groups = [group_2.name, group_1.name]
+    if grains["os_family"] == "Suse" and (
+        grains.get("transactional", False) or grains.get("osmajorrelease", 0) >= 16
+    ):
+        expected_groups.append(username)
+
+    ret = states.user.present(
+        name=username,
+        optional_groups=[group_1.name, group_2.name],
+    )
+    assert ret.result is True
+
+    user_info = modules.user.info(username)
+    assert user_info
+    assert sorted(user_info["groups"]) == sorted(expected_groups)
+
+    expected_groups.remove(group_2.name)
+
+    # run again and remove group_2
+    ret = states.user.present(
+        name=username,
+        optional_groups=[group_1.name],
+    )
+    assert ret.result is True
+
+    user_info = modules.user.info(username)
+    assert user_info
+    assert sorted(user_info["groups"]) == sorted(expected_groups)
+
+
+@pytest.fixture
+def user_present_groups(states):
+    groups = ["testgroup1", "testgroup2"]
+    try:
+        yield groups
+    finally:
+        for group in groups:
+            ret = states.group.absent(name=group)
+            assert ret.result is True
+
+
+@pytest.mark.skip_unless_on_linux(reason="underlying functionality only runs on Linux")
+def test_user_present_no_groups(modules, states, username, user_present_groups, guid):
+    """
+    test user.present when groups arg is not
+    included by the group is created in another
+    state. Re-run the states to ensure there are
+    not changes and it is idempotent.
+    """
+    ret = states.group.present(name=username, gid=guid)
+    assert ret.result is True
+
+    ret = states.user.present(
+        name=username,
+        uid=guid,
+        gid=guid,
+    )
+    assert ret.result is True
+    assert ret.changes["groups"] == [username]
+    assert ret.changes["name"] == username
+
+    ret = states.group.present(
+        name=user_present_groups[0],
+        members=[username],
+    )
+    assert ret.changes["members"] == [username]
+
+    ret = states.group.present(
+        name=user_present_groups[1],
+        members=[username],
+    )
+    assert ret.changes["members"] == [username]
+
+    user_info = modules.user.info(username)
+    assert user_info
+    assert user_info["groups"] == [username, *user_present_groups]
+
+    # run again, expecting no changes
+    ret = states.group.present(name=username)
+    assert ret.result is True
+    assert ret.changes == {}
+
+    ret = states.user.present(
+        name=username,
+    )
+    assert ret.result is True
+    assert ret.changes == {}
+
+    ret = states.group.present(
+        name=user_present_groups[0],
+        members=[username],
+    )
+    assert ret.result is True
+    assert ret.changes == {}
+
+    ret = states.group.present(
+        name=user_present_groups[1],
+        members=[username],
+    )
+    assert ret.result is True
+    assert ret.changes == {}
+
+    user_info = modules.user.info(username)
+    assert user_info
+    assert user_info["groups"] == [username, *user_present_groups]
+
+
+# ---------------------------------------------------------------------------
+# Windows password tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def account_with_password(states, username):
+    """Create a test account via user.present with a known password."""
+    ret = states.user.present(name=username, password="P@ssW0rd!")
+    assert ret.result is True
+    yield username
+
+
+@pytest.mark.skip_unless_on_windows
+def test_win_user_present_same_password(states, account_with_password):
+    """
+    Running user.present with the same password a second time should be a
+    no-op: result True, no changes, comment contains 'up to date'.
+    """
+    ret = states.user.present(name=account_with_password, password="P@ssW0rd!")
+    assert ret.result is True
+    assert ret.changes == {}
+    assert "up to date" in ret.comment
+
+
+@pytest.mark.skip_unless_on_windows
+def test_win_user_present_new_password_test_mode(states, account_with_password):
+    """
+    Running user.present with a different password and test=True should show
+    a pending passwd change in the comment without applying it.
+    """
+    ret = states.user.present(
+        name=account_with_password, password="N3wP@ssW0rd!", test=True
+    )
+    assert ret.result is None
+    assert ret.changes == {}
+    assert "passwd: XXX-REDACTED-XXX" in ret.comment
+
+
+@pytest.mark.skip_unless_on_windows
+def test_win_user_present_new_password(states, account_with_password):
+    """
+    Running user.present with a different password should change it and
+    report the change as passwd: XXX-REDACTED-XXX.
+
+    Newer ``shadow.info`` on Windows additionally surfaces
+    ``password_changed`` and ``lstchg`` keys (the wrapped Unix shadow
+    fields) whenever the password changes, so the changes dict now
+    has more than just ``passwd``.  The contract this test pins is
+    that the redacted ``passwd`` change is *present*; the auxiliary
+    timestamp keys are implementation detail and aren't worth
+    re-asserting on every shadow refactor.
+    """
+    ret = states.user.present(name=account_with_password, password="N3wP@ssW0rd!")
+    assert ret.result is True
+    assert ret.changes.get("passwd") == "XXX-REDACTED-XXX", ret.changes

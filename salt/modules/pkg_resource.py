@@ -2,7 +2,6 @@
 Resources needed by pkg providers
 """
 
-
 import copy
 import fnmatch
 import logging
@@ -12,7 +11,7 @@ import pprint
 import salt.utils.data
 import salt.utils.versions
 import salt.utils.yaml
-from salt.exceptions import SaltInvocationError
+from salt.exceptions import CommandExecutionError, SaltInvocationError
 
 log = logging.getLogger(__name__)
 __SUFFIX_NOT_NEEDED = ("x86_64", "noarch")
@@ -26,11 +25,24 @@ def _repack_pkgs(pkgs, normalize=True):
     if normalize and "pkg.normalize_name" in __salt__:
         _normalize_name = __salt__["pkg.normalize_name"]
     else:
-        _normalize_name = lambda pkgname: pkgname
-    return {
+
+        def _normalize_name(pkgname):
+            return pkgname
+
+    repacked_pkgs = {
         _normalize_name(str(x)): str(y) if y is not None else y
         for x, y in salt.utils.data.repack_dictlist(pkgs).items()
     }
+
+    # Check if there were collisions in names
+    if len(pkgs) != len(repacked_pkgs):
+        raise SaltInvocationError(
+            "You are passing a list of packages that contains duplicated packages names: {}. This cannot be processed. In case you are targeting different versions of the same package, please target them individually".format(
+                pkgs
+            )
+        )
+
+    return repacked_pkgs
 
 
 def pack_sources(sources, normalize=True):
@@ -60,7 +72,9 @@ def pack_sources(sources, normalize=True):
     if normalize and "pkg.normalize_name" in __salt__:
         _normalize_name = __salt__["pkg.normalize_name"]
     else:
-        _normalize_name = lambda pkgname: pkgname
+
+        def _normalize_name(pkgname):
+            return pkgname
 
     if isinstance(sources, str):
         try:
@@ -141,7 +155,14 @@ def parse_targets(
             if __salt__["config.valid_fileproto"](pkg_src):
                 # Cache package from remote source (salt master, HTTP, FTP) and
                 # append the cached path.
-                srcinfo.append(__salt__["cp.cache_file"](pkg_src, saltenv))
+                cached_path = __salt__["cp.cache_file"](pkg_src, saltenv)
+                if not cached_path:
+                    raise CommandExecutionError(
+                        "Unable to cache source {} for package {}".format(
+                            pkg_src, pkg_name
+                        )
+                    )
+                srcinfo.append(cached_path)
             else:
                 # Package file local to the minion, just append the path to the
                 # package file.
@@ -184,7 +205,7 @@ def version(*names, **kwargs):
     ret = {}
     versions_as_list = salt.utils.data.is_true(kwargs.pop("versions_as_list", False))
     pkg_glob = False
-    if len(names) != 0:
+    if names:
         pkgs = __salt__["pkg.list_pkgs"](versions_as_list=True, **kwargs)
         for name in names:
             if "*" in name:
@@ -307,8 +328,8 @@ def version_compare(ver1, oper, ver2, ignore_epoch=False):
 
     .. code-block:: jinja
 
-        {%- set postfix_version = salt.pkg.version('postfix') %}
-        {%- if postfix_version and salt.pkg_resource.version_compare(postfix_version, '>=', '3.3', ignore_epoch=True) %}
+        {%- set postfix_version = salt['pkg.version']('postfix') %}
+        {%- if postfix_version and salt['pkg_resource.version_compare'](postfix_version, '>=', '3.3', ignore_epoch=True) %}
           {#- do stuff #}
         {%- endif %}
 
@@ -399,7 +420,7 @@ def format_version(epoch, version, release):
     """
     Formats a version string for list_pkgs.
     """
-    full_version = "{}:{}".format(epoch, version) if epoch else version
+    full_version = f"{epoch}:{version}" if epoch else version
     if release:
-        full_version += "-{}".format(release)
+        full_version += f"-{release}"
     return full_version

@@ -6,6 +6,7 @@ import logging
 import subprocess
 
 import pytest
+
 import salt.utils.platform
 
 log = logging.getLogger(__name__)
@@ -48,9 +49,10 @@ def test_managed(cron_account, salt_cli, salt_minion, base_env_state_tree_root_d
             name="salt://issue-46881/cron",
             user=cron_account.username,
             minion_tgt=salt_minion.id,
+            _timeout=120,
         )
-    assert ret.exitcode == 0, ret
-    state = ret.json["cron_|-salt://issue-46881/cron_|-salt://issue-46881/cron_|-file"]
+    assert ret.returncode == 0, ret
+    state = ret.data["cron_|-salt://issue-46881/cron_|-salt://issue-46881/cron_|-file"]
     assert "changes" in state
     assert "diff" in state["changes"]
     assert state["changes"]["diff"] == expected

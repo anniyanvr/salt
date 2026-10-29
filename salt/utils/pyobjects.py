@@ -7,8 +7,7 @@ for more documentation.
 
 import inspect
 import logging
-
-from salt.utils.odict import OrderedDict
+from collections import OrderedDict
 
 REQUISITES = (
     "listen",
@@ -250,10 +249,10 @@ class State:
 
     @property
     def full_func(self):
-        return "{!s}.{!s}".format(self.module, self.func)
+        return f"{self.module!s}.{self.func!s}"
 
     def __str__(self):
-        return "{!s} = {!s}:{!s}".format(self.id_, self.full_func, self.attrs)
+        return f"{self.id_!s} = {self.full_func!s}:{self.attrs!s}"
 
     def __call__(self):
         return {self.full_func: self.attrs}
@@ -283,7 +282,7 @@ class SaltObject:
         class __wrapper__:
             def __getattr__(wself, func):  # pylint: disable=E0213
                 try:
-                    return self._salt["{}.{}".format(mod, func)]
+                    return self._salt[f"{mod}.{func}"]
                 except KeyError:
                     raise AttributeError
 
@@ -378,7 +377,13 @@ class MapMeta(type):
                     attrs.update(match_attrs)
 
         if hasattr(cls, "merge"):
-            pillar = Map.__salt__["pillar.get"](cls.merge)
+            # The merged values become Map class attributes that are used
+            # operationally in rendered states, so the real pillar values
+            # are needed here, not the masked placeholders. The pyobjects
+            # renderer does not run under the mask_pillar=False context
+            # that string-template renderers (jinja, mako, ...) get from
+            # salt.utils.templates.wrap_tmpl_func.
+            pillar = Map.__salt__["pillar.get"](cls.merge, unmask=True)
             if pillar:
                 attrs.update(pillar)
 

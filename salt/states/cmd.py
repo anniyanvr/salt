@@ -229,8 +229,52 @@ To use it, one may pass it like this. Example:
       cmd.run:
         - env: {{ salt['pillar.get']('example:key', {}) }}
 
-"""
+Better yet, use the slots feature to insert the data at runtime and minimize pillar data exposure:
 
+.. code-block:: yaml
+
+    printenv:
+      cmd.run:
+        - env: __slot__:salt:pillar.get(example:key)
+
+How do I pass sensitive data to a command?
+------------------------------------------
+
+Passing sensitive data to commands using command line arguments
+or environment variables is a well-known security loophole and is not recommended.
+
+If your command can read from stdin, use the stdin option
+in combination with the slots feature. Example:
+
+.. code-block:: yaml
+
+    my-command --read-secret-from-stdin:
+      cmd.run:
+        - stdin: __slot__:salt:pillar.get(example:secret)
+
+Some commands read from stdin when "-" is passed as an input file:
+
+.. code-block:: yaml
+
+    gcc - -x c -o ./myprogram:
+      cmd.run:
+        - stdin: __slot__:salt:pillar.get(example:my_super_secret_c_code)
+
+If your command can read from a file and is running on a Unix-ish system,
+pass /dev/stdin as the file and feed the data to stdin. Example:
+
+.. code-block:: yaml
+
+    step ca certificate server.example.com cert.pem key.pem --provisioner JWK --provisioner-password-file /dev/stdin:
+      cmd.run:
+        - stdin: __slot__:salt:pillar.get(server:provisioner_password)
+        - unless: step certificate needs-renewal cert.pem 2>&1 | grep "certificate does not need renewal"
+
+Note: The use of the runas option or sudo will cause permission errors when reading /dev/stdin.
+If you need to run as a specific user the command will have to read from the usual internal stdin file descriptor.
+
+The use of the slots feature keeps minions who can render the state file from stealing the password.
+"""
 
 import copy
 import logging
@@ -317,7 +361,7 @@ def _is_true(val):
         return True
     elif str(val).lower() in ("false", "no", "0"):
         return False
-    raise ValueError("Failed parsing boolean value: {}".format(val))
+    raise ValueError(f"Failed parsing boolean value: {val}")
 
 
 def wait(
@@ -328,14 +372,13 @@ def wait(
     shell=None,
     env=(),
     stateful=False,
-    umask=None,
     output_loglevel="debug",
     hide_output=False,
     use_vt=False,
     success_retcodes=None,
     success_stdout=None,
     success_stderr=None,
-    **kwargs
+    **kwargs,
 ):
     """
     Run the given command only if the watch statement calls it.
@@ -358,7 +401,8 @@ def wait(
         will run inside a chroot
 
     runas
-        The user name to run the command as
+        The user name to run the command as. On Windows, a password may be
+        required — see :mod:`cmd.run <salt.states.cmd.run>` for details.
 
     shell
         The shell to use for execution, defaults to /bin/sh
@@ -408,9 +452,6 @@ def wait(
             matters, i.e. Windows uses `Path` as opposed to `PATH` for other
             systems.
 
-    umask
-         The umask (in octal) to use when running the command.
-
     stateful
         The command being executed is expected to return data about executing
         a state. For more information, see the :ref:`stateful-argument` section.
@@ -444,10 +485,11 @@ def wait(
         interactively to the console and the logs.
         This is experimental.
 
-    success_retcodes: This parameter will allow a list of
-        non-zero return codes that should be considered a success.  If the
-        return code returned from the run matches any in the provided list,
-        the return code will be overridden with zero.
+    success_retcodes
+        This parameter allows you to specify a list of non-zero return codes
+        that should be considered as successful. If the return code from the
+        command matches any in the list, the state will have a ``True`` result
+        instead of ``False``.
 
       .. versionadded:: 2019.2.0
 
@@ -482,14 +524,13 @@ def wait_script(
     shell=None,
     env=None,
     stateful=False,
-    umask=None,
     use_vt=False,
     output_loglevel="debug",
     hide_output=False,
     success_retcodes=None,
     success_stdout=None,
     success_stderr=None,
-    **kwargs
+    **kwargs,
 ):
     """
     Download a script from a remote source and execute it only if a watch
@@ -515,7 +556,8 @@ def wait_script(
         /root
 
     runas
-        The user name to run the command as
+        The user name to run the command as. On Windows, a password may be
+        required — see :mod:`cmd.script <salt.states.cmd.script>` for details.
 
     shell
         The shell to use for execution, defaults to the shell grain
@@ -565,9 +607,6 @@ def wait_script(
             matters, i.e. Windows uses `Path` as opposed to `PATH` for other
             systems.
 
-    umask
-         The umask (in octal) to use when running the command.
-
     stateful
         The command being executed is expected to return data about executing
         a state. For more information, see the :ref:`stateful-argument` section.
@@ -594,10 +633,11 @@ def wait_script(
 
         .. versionadded:: 2018.3.0
 
-    success_retcodes: This parameter will allow a list of
-        non-zero return codes that should be considered a success.  If the
-        return code returned from the run matches any in the provided list,
-        the return code will be overridden with zero.
+    success_retcodes
+        This parameter allows you to specify a list of non-zero return codes
+        that should be considered as successful. If the return code from the
+        command matches any in the list, the state will have a ``True`` result
+        instead of ``False``.
 
       .. versionadded:: 2019.2.0
 
@@ -624,11 +664,11 @@ def run(
     cwd=None,
     root=None,
     runas=None,
+    password=None,
     shell=None,
     env=None,
     prepend_path=None,
     stateful=False,
-    umask=None,
     output_loglevel="debug",
     hide_output=False,
     timeout=None,
@@ -637,7 +677,7 @@ def run(
     success_retcodes=None,
     success_stdout=None,
     success_stderr=None,
-    **kwargs
+    **kwargs,
 ):
     """
     Run a command if certain circumstances are met.  Use ``cmd.wait`` if you
@@ -667,7 +707,26 @@ def run(
         will run inside a chroot
 
     runas
-        The user name (or uid) to run the command as
+        The user name (or uid) to run the command as. The default behavior is
+        to run as the user under which Salt is running.
+
+        .. note::
+
+            On Windows, a ``password`` may be required depending on the
+            privileges of the salt-minion process. See the ``password``
+            parameter for details. To specify a domain account, use the UPN
+            format (``user@domain``) or down-level logon name
+            (``DOMAIN\\user``).
+
+    password
+        Windows only. The password for the account specified by ``runas``.
+        Required only when the salt-minion is **not** running as SYSTEM or as
+        an elevated Administrator. When Salt has sufficient privileges it can
+        obtain a logon token for the target user through Windows impersonation
+        APIs without needing their credentials. This parameter is ignored on
+        non-Windows platforms.
+
+        .. versionadded:: 3000
 
     shell
         The shell to use for execution, defaults to the shell grain
@@ -727,9 +786,6 @@ def run(
         The command being executed is expected to return data about executing
         a state. For more information, see the :ref:`stateful-argument` section.
 
-    umask
-        The umask (in octal) to use when running the command.
-
     output_loglevel : debug
         Control the loglevel at which the output from the command is logged to
         the minion log.
@@ -775,10 +831,11 @@ def run(
 
         .. versionadded:: 2016.3.6
 
-    success_retcodes: This parameter will allow a list of
-        non-zero return codes that should be considered a success.  If the
-        return code returned from the run matches any in the provided list,
-        the return code will be overridden with zero.
+    success_retcodes
+        This parameter allows you to specify a list of non-zero return codes
+        that should be considered as successful. If the return code from the
+        command matches any in the list, the state will have a ``True`` result
+        instead of ``False``.
 
       .. versionadded:: 2019.2.0
 
@@ -843,11 +900,11 @@ def run(
             "cwd": cwd,
             "root": root,
             "runas": runas,
+            "password": password,
             "use_vt": use_vt,
             "shell": shell or __grains__["shell"],
             "env": env,
             "prepend_path": prepend_path,
-            "umask": umask,
             "output_loglevel": output_loglevel,
             "hide_output": hide_output,
             "success_retcodes": success_retcodes,
@@ -858,11 +915,12 @@ def run(
 
     if __opts__["test"] and not test_name:
         ret["result"] = None
-        ret["comment"] = 'Command "{}" would have been executed'.format(name)
+        ret["comment"] = f'Command "{name}" would have been executed'
+        ret["changes"] = {"cmd": name}
         return _reinterpreted_state(ret) if stateful else ret
 
     if cwd and not os.path.isdir(cwd):
-        ret["comment"] = 'Desired working directory "{}" is not available'.format(cwd)
+        ret["comment"] = f'Desired working directory "{cwd}" is not available'
         return ret
 
     # Wow, we passed the test, run this sucker!
@@ -877,7 +935,7 @@ def run(
 
     ret["changes"] = cmd_all
     ret["result"] = not bool(cmd_all["retcode"])
-    ret["comment"] = 'Command "{}" run'.format(name)
+    ret["comment"] = f'Command "{name}" run'
 
     # Ignore timeout errors if asked (for nohups) and treat cmd as a success
     if ignore_timeout:
@@ -905,7 +963,6 @@ def script(
     shell=None,
     env=None,
     stateful=False,
-    umask=None,
     timeout=None,
     use_vt=False,
     output_loglevel="debug",
@@ -915,7 +972,7 @@ def script(
     success_retcodes=None,
     success_stdout=None,
     success_stderr=None,
-    **kwargs
+    **kwargs,
 ):
     """
     Download a script and execute it with specified arguments.
@@ -939,33 +996,26 @@ def script(
         /root
 
     runas
-        Specify an alternate user to run the command. The default
-        behavior is to run as the user under which Salt is running. If running
-        on a Windows minion you must also use the ``password`` argument, and
-        the target user account must be in the Administrators group.
+        Specify an alternate user to run the command. The default behavior is
+        to run as the user under which Salt is running.
 
         .. note::
 
-            For Windows users, specifically Server users, it may be necessary
-            to specify your runas user using the User Logon Name instead of the
-            legacy logon name. Traditionally, logons would be in the following
-            format.
-
-                ``Domain/user``
-
-            In the event this causes issues when executing scripts, use the UPN
-            format which looks like the following.
-
-                ``user@domain.local``
-
-            More information <https://github.com/saltstack/salt/issues/55080>
+            On Windows, a ``password`` may be required depending on the
+            privileges of the salt-minion process. See the ``password``
+            parameter for details. To specify a domain account, use the UPN
+            format (``user@domain``) or down-level logon name
+            (``DOMAIN\\user``).
 
     password
+        Windows only. The password for the account specified by ``runas``.
+        Required only when the salt-minion is **not** running as SYSTEM or as
+        an elevated Administrator. When Salt has sufficient privileges it can
+        obtain a logon token for the target user through Windows impersonation
+        APIs without needing their credentials. This parameter is ignored on
+        non-Windows platforms.
 
-    .. versionadded:: 3000
-
-        Windows only. Required when specifying ``runas``. This
-        parameter will be ignored on non-Windows platforms.
+        .. versionadded:: 3000
 
     shell
         The shell to use for execution. The default is set in grains['shell']
@@ -1017,9 +1067,6 @@ def script(
 
     saltenv : ``base``
         The Salt environment to use
-
-    umask
-         The umask (in octal) to use when running the command.
 
     stateful
         The command being executed is expected to return data about executing
@@ -1074,10 +1121,11 @@ def script(
 
         .. versionadded:: 2018.3.0
 
-    success_retcodes: This parameter will allow a list of
-        non-zero return codes that should be considered a success.  If the
-        return code returned from the run matches any in the provided list,
-        the return code will be overridden with zero.
+    success_retcodes
+        This parameter allows you to specify a list of non-zero return codes
+        that should be considered as successful. If the return code from the
+        command matches any in the list, the state will have a ``True`` result
+        instead of ``False``.
 
       .. versionadded:: 2019.2.0
 
@@ -1112,19 +1160,22 @@ def script(
         return ret
 
     if context and not isinstance(context, dict):
-        ret[
-            "comment"
-        ] = "Invalidly-formatted 'context' parameter. Must be formed as a dict."
+        ret["comment"] = (
+            "Invalidly-formatted 'context' parameter. Must be formed as a dict."
+        )
         return ret
     if defaults and not isinstance(defaults, dict):
-        ret[
-            "comment"
-        ] = "Invalidly-formatted 'defaults' parameter. Must be formed as a dict."
+        ret["comment"] = (
+            "Invalidly-formatted 'defaults' parameter. Must be formed as a dict."
+        )
         return ret
 
     if runas and salt.utils.platform.is_windows() and not password:
-        ret["comment"] = "Must supply a password if runas argument is used on Windows."
-        return ret
+        log.warning(
+            "runas is set without a password on Windows. This will succeed "
+            "only if the salt-minion is running as SYSTEM or as an elevated "
+            "Administrator."
+        )
 
     tmpctx = defaults if defaults else {}
     if context:
@@ -1139,7 +1190,6 @@ def script(
             "env": env,
             "cwd": cwd,
             "template": template,
-            "umask": umask,
             "timeout": timeout,
             "output_loglevel": output_loglevel,
             "hide_output": hide_output,
@@ -1168,11 +1218,11 @@ def script(
 
     if __opts__["test"] and not test_name:
         ret["result"] = None
-        ret["comment"] = "Command '{}' would have been executed".format(name)
+        ret["comment"] = f"Command '{name}' would have been executed"
         return _reinterpreted_state(ret) if stateful else ret
 
     if cwd and not os.path.isdir(cwd):
-        ret["comment"] = 'Desired working directory "{}" is not available'.format(cwd)
+        ret["comment"] = f'Desired working directory "{cwd}" is not available'
         return ret
 
     # Wow, we passed the test, run this sucker!
@@ -1192,7 +1242,7 @@ def script(
             source, __env__
         )
     else:
-        ret["comment"] = "Command '{}' run".format(name)
+        ret["comment"] = f"Command '{name}' run"
     if stateful:
         ret = _reinterpreted_state(ret)
     if __opts__["test"] and cmd_all["retcode"] == 0 and ret["changes"]:
@@ -1208,7 +1258,7 @@ def call(
     output_loglevel="debug",
     hide_output=False,
     use_vt=False,
-    **kwargs
+    **kwargs,
 ):
     """
     Invoke a pre-defined Python function with arguments specified in the state
@@ -1245,7 +1295,6 @@ def call(
         "use_vt": use_vt,
         "output_loglevel": output_loglevel,
         "hide_output": hide_output,
-        "umask": kwargs.get("umask"),
     }
 
     if not kws:
@@ -1272,7 +1321,7 @@ def wait_call(
     use_vt=False,
     output_loglevel="debug",
     hide_output=False,
-    **kwargs
+    **kwargs,
 ):
     # Ignoring our arguments is intentional.
     return {"name": name, "changes": {}, "result": True, "comment": ""}

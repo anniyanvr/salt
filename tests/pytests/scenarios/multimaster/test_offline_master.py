@@ -2,8 +2,11 @@ import time
 
 import pytest
 
+pytestmark = [
+    pytest.mark.core_test,
+]
 
-@pytest.mark.slow_test
+
 def test_minion_hangs_on_master_failure_50814(
     event_listener,
     salt_mm_master_1,
@@ -19,12 +22,12 @@ def test_minion_hangs_on_master_failure_50814(
     event_count = 3
     while True:
         check_event_start_time = time.time()
-        event_tag = "myco/foo/bar/{}".format(event_count)
+        event_tag = f"myco/foo/bar/{event_count}"
         ret = mm_master_2_salt_cli.run(
             "event.send", event_tag, minion_tgt=salt_mm_minion_1.id
         )
-        assert ret.exitcode == 0
-        assert ret.json is True
+        assert ret.returncode == 0
+        assert ret.data is True
         # Let's make sure we get the event back
         expected_patterns = [
             (salt_mm_master_1.id, event_tag),
@@ -42,20 +45,16 @@ def test_minion_hangs_on_master_failure_50814(
             break
         time.sleep(0.5)
 
-    def wait_for_minion(salt_cli, tgt, timeout=30):
+    def wait_for_minion(salt_cli, tgt, timeout=60):
         start = time.time()
         while True:
-            ret = salt_cli.run("test.ping", "--timeout=5", minion_tgt=tgt)
-            if ret.exitcode == 0 and ret.json is True:
+            ret = salt_cli.run(
+                "test.ping", "--timeout=5", minion_tgt=tgt, _timeout=timeout
+            )
+            if ret.returncode == 0 and ret.data is True:
                 break
             if time.time() - start > timeout:
                 raise TimeoutError("Minion failed to respond top ping after timeout")
-
-    # Wait for the minion to re-connect so this test will not affect any
-    # others.
-    salt_mm_master_1.after_start(
-        wait_for_minion, salt_mm_master_1.salt_cli(), salt_mm_minion_1.id
-    )
 
     # Now, let's try this one of the masters offline
     with salt_mm_master_1.stopped():
@@ -64,12 +63,12 @@ def test_minion_hangs_on_master_failure_50814(
         event_count = 1
         while True:
             check_event_start_time = time.time()
-            event_tag = "myco/foo/bar/{}".format(event_count)
+            event_tag = f"myco/foo/bar/{event_count}"
             ret = mm_master_2_salt_cli.run(
                 "event.send", event_tag, minion_tgt=salt_mm_minion_1.id
             )
-            assert ret.exitcode == 0
-            assert ret.json is True
+            assert ret.returncode == 0
+            assert ret.data is True
 
             # Let's make sure we get the event back
             expected_patterns = [
@@ -88,3 +87,9 @@ def test_minion_hangs_on_master_failure_50814(
             if event_count > 3:
                 break
             time.sleep(0.5)
+
+    # Wait for the minion to re-connect before the next test touches the
+    # shared multimaster fixtures.  Done here (not via after_start) so the
+    # callback does not persist on the package-scoped daemon and fire for
+    # every subsequent test that starts the master.
+    wait_for_minion(salt_mm_master_1.salt_cli(), salt_mm_minion_1.id)

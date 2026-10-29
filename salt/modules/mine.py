@@ -6,9 +6,10 @@ import logging
 import time
 import traceback
 
+import salt.channel.client
 import salt.crypt
 import salt.payload
-import salt.transport.client
+import salt.transport
 import salt.utils.args
 import salt.utils.dictupdate
 import salt.utils.event
@@ -57,24 +58,23 @@ def _mine_function_available(func):
 
 
 def _mine_send(load, opts):
-    eventer = salt.utils.event.MinionEvent(opts, listen=False)
-    event_ret = eventer.fire_event(load, "_minion_mine")
-    # We need to pause here to allow for the decoupled nature of
-    # events time to allow the mine to propagate
-    time.sleep(0.5)
-    return event_ret
+    # Use MinionEvent as a context manager so its subscriber / pusher /
+    # SyncWrapper chain is torn down synchronously.  Prior fire-and-forget
+    # form (``MinionEvent(...); .fire_event(...); return``) left the
+    # temporary event bundle unreferenced and reliant on GC to invoke
+    # ``__del__``; each per-mine-tick invocation leaked one
+    # ``PublishServer`` + ``_TCPPubServerPublisher`` + ``SyncWrapper``
+    # onto the minion event bus (issue #70175's per-job triad).
+    with salt.utils.event.MinionEvent(opts, listen=False) as eventer:
+        event_ret = eventer.fire_event(load, "_minion_mine")
+        # We need to pause here to allow for the decoupled nature of
+        # events time to allow the mine to propagate
+        time.sleep(0.5)
+        return event_ret
 
 
 def _mine_get(load, opts):
-    if opts.get("transport", "") in ("zeromq", "tcp"):
-        try:
-            load["tok"] = _auth().gen_token(b"salt")
-        except AttributeError:
-            log.error(
-                "Mine could not authenticate with master. Mine could not be retrieved."
-            )
-            return False
-    with salt.transport.client.ReqChannel.factory(opts) as channel:
+    with salt.channel.client.ReqChannel.factory(opts) as channel:
         return channel.send(load)
 
 
@@ -185,7 +185,7 @@ def update(clear=False, mine_functions=None):
             res = salt.utils.functools.call_function(
                 __salt__[function_name or function_alias],
                 *function_args,
-                **function_kwargs
+                **function_kwargs,
             )
         except Exception:  # pylint: disable=broad-except
             trace = traceback.format_exc()
@@ -239,9 +239,9 @@ def send(name, *args, **kwargs):
 
     .. code-block:: bash
 
-        salt '*' mine.send network.ip_addrs eth0
-        salt '*' mine.send eth0_ip_addrs mine_function=network.ip_addrs eth0
-        salt '*' mine.send eth0_ip_addrs mine_function=network.ip_addrs eth0 allow_tgt='G@grain:value' allow_tgt_type=compound
+        salt '*' mine.send network.ip_addrs interface=eth0
+        salt '*' mine.send eth0_ip_addrs mine_function=network.ip_addrs interface=eth0
+        salt '*' mine.send eth0_ip_addrs mine_function=network.ip_addrs interface=eth0 allow_tgt='G@grain:value' allow_tgt_type=compound
     """
     kwargs = salt.utils.args.clean_kwargs(**kwargs)
     mine_function = kwargs.pop("mine_function", None)
@@ -300,7 +300,7 @@ def get(tgt, fun, tgt_type="glob", exclude_minion=False):
 
         .. code-block:: jinja
 
-            {% set minion_ips = salt.saltutil.runner('mine.get',
+            {% set minion_ips = salt['saltutil.runner']('mine.get',
                 tgt='*',
                 fun='network.ip_addrs',
                 tgt_type='glob') %}
@@ -308,7 +308,7 @@ def get(tgt, fun, tgt_type="glob", exclude_minion=False):
     # Load from local minion's cache
     if __opts__["file_client"] == "local":
         ret = {}
-        is_target = {
+        _targets = {
             "glob": __salt__["match.glob"],
             "pcre": __salt__["match.pcre"],
             "list": __salt__["match.list"],
@@ -318,8 +318,8 @@ def get(tgt, fun, tgt_type="glob", exclude_minion=False):
             "compound": __salt__["match.compound"],
             "pillar": __salt__["match.pillar"],
             "pillar_pcre": __salt__["match.pillar_pcre"],
-        }[tgt_type](tgt)
-        if not is_target:
+        }
+        if not _targets[tgt_type](tgt):
             return ret
 
         data = __salt__["data.get"]("mine_cache")

@@ -13,22 +13,30 @@ import sys
 import tempfile
 
 import pytest
+
+import salt.grains.extra
 import salt.modules.cmdmod as cmdmod
 import salt.utils.files
+import salt.utils.path
 import salt.utils.platform
 import salt.utils.stringutils
+from salt._logging import LOG_LEVELS
 from salt.exceptions import CommandExecutionError
-from salt.log.setup import LOG_LEVELS
 from tests.support.mock import MagicMock, Mock, MockTimedProc, mock_open, patch
 from tests.support.runtests import RUNTIME_VARS
+
+pytestmark = [
+    pytest.mark.core_test,
+    pytest.mark.windows_whitelisted,
+]
 
 DEFAULT_SHELL = "foo/bar"
 MOCK_SHELL_FILE = "# List of acceptable shells\n\n/bin/bash\n"
 
 
 @pytest.fixture
-def configure_loader_modules():
-    return {cmdmod: {}}
+def configure_loader_modules(minion_opts):
+    return {cmdmod: {"__opts__": minion_opts}}
 
 
 @pytest.fixture(scope="module")
@@ -51,6 +59,20 @@ def test_render_cmd_no_template():
     Tests return when template=None
     """
     assert cmdmod._render_cmd("foo", "bar", None) == ("foo", "bar")
+
+
+def test_render_cmd_saltenv_from_config():
+    mock_template = MagicMock()
+    with patch.dict(cmdmod.__opts__, {"saltenv": "base"}):
+        with patch.dict(
+            "salt.utils.templates.TEMPLATE_REGISTRY", {"test": mock_template}
+        ):
+            cmdmod._render_cmd("test", "test", "test")
+            assert mock_template.call_count == 2
+            assert mock_template.call_args[1]["saltenv"] == "base"
+            cmdmod._render_cmd("test", "test", "test", saltenv="fake")
+            assert mock_template.call_count == 4
+            assert mock_template.call_args[1]["saltenv"] == "fake"
 
 
 def test_render_cmd_unavailable_engine():
@@ -147,6 +169,112 @@ def test_run_runas_with_windows():
                         cmdmod._run("foo", "bar", runas="baz")
 
 
+def test_run_windows_preserves_cmd_string_quoting():
+    """
+    On Windows, shlex_split must NOT be called on the command string so that
+    Windows-style argument quoting (e.g. MYPROPERTY="C:\\path with space") is
+    preserved when the string is handed directly to CreateProcess.
+    Regression test for issue #68950.
+    """
+    mock_proc = MockTimedProc(stdout=b"", stderr=b"")
+    with patch("salt.utils.platform.is_windows", MagicMock(return_value=True)), patch(
+        "salt.utils.path.which",
+        MagicMock(return_value="C:\\Windows\\system32\\cmd.exe"),
+    ), patch(
+        "salt.utils.timed_subprocess.TimedProc", MagicMock(return_value=mock_proc)
+    ), patch(
+        "salt.utils.args.shlex_split"
+    ) as mock_shlex:
+        try:
+            cmdmod._run(
+                '"msiexec" /I "C:\\pkg.msi" MYPROPERTY="C:\\some file.txt"',
+                cwd="C:\\",
+                shell="C:\\Windows\\system32\\cmd.exe",
+                python_shell=False,
+            )
+        except Exception:  # pylint: disable=broad-except
+            pass
+        mock_shlex.assert_not_called()
+
+
+@pytest.mark.skip_unless_on_windows
+def test_run_windows_cmd_runas_passes_compound_to_cmd():
+    """
+    runas + cmd.exe must use prepend_cmd so the user string is one cmd /c
+    argument; otherwise shlex splits on & and the child never sees a compound
+    line (regression: cd ... & dir under runas).
+    """
+    win_runas_mock = MagicMock(
+        return_value={"pid": 1, "retcode": 0, "stdout": "ok", "stderr": ""}
+    )
+    cmd_str = r"cd /d C:\salt_test_dir & echo marker_compound_runas"
+    with patch("salt.modules.cmdmod._is_valid_shell", MagicMock(return_value=True)):
+        with patch("salt.utils.platform.is_windows", MagicMock(return_value=True)):
+            with patch("salt.modules.cmdmod.HAS_WIN_RUNAS", True):
+                with patch("salt.modules.cmdmod.win_runas", win_runas_mock):
+                    with patch(
+                        "salt.utils.path.which",
+                        return_value="C:\\Windows\\System32\\cmd.exe",
+                    ):
+                        with patch(
+                            "salt.utils.win_chcp.get_codepage_id",
+                            MagicMock(return_value=65001),
+                        ):
+                            cmdmod._run(
+                                cmd_str,
+                                cwd=tempfile.gettempdir(),
+                                runas="someuser",
+                                password="secret",
+                                shell="cmd",
+                                python_shell=False,
+                            )
+    passed = win_runas_mock.call_args[0][0]
+    # Full prepended line must reach win_runas as one string; shlex_split is
+    # skipped so paths with spaces are not broken and so & stays in the /c payload.
+    assert isinstance(passed, str)
+    assert "/c" in passed
+    assert "&" in passed
+    assert "marker_compound_runas" in passed
+
+
+@pytest.mark.skip_unless_on_windows
+def test_run_windows_cmd_runas_skips_shlex_split():
+    """
+    After ``prepend_cmd``, the full ``cmd.exe /c ...`` line must not be passed
+    through ``shlex_split`` or paths with spaces and ``&`` in the /c payload break.
+    """
+    shlex_split = MagicMock(
+        side_effect=AssertionError("shlex_split must not run for runas prepended line")
+    )
+    win_runas_mock = MagicMock(
+        return_value={"pid": 1, "retcode": 0, "stdout": "ok", "stderr": ""}
+    )
+    cmd_str = r"cd /d C:\salt_test_dir & echo skip_shlex_check"
+    with patch("salt.modules.cmdmod._is_valid_shell", MagicMock(return_value=True)):
+        with patch("salt.utils.platform.is_windows", MagicMock(return_value=True)):
+            with patch("salt.modules.cmdmod.HAS_WIN_RUNAS", True):
+                with patch("salt.modules.cmdmod.win_runas", win_runas_mock):
+                    with patch(
+                        "salt.utils.path.which",
+                        return_value="C:\\Windows\\System32\\cmd.exe",
+                    ):
+                        with patch(
+                            "salt.utils.win_chcp.get_codepage_id",
+                            MagicMock(return_value=65001),
+                        ):
+                            with patch("salt.utils.args.shlex_split", shlex_split):
+                                cmdmod._run(
+                                    cmd_str,
+                                    cwd=tempfile.gettempdir(),
+                                    runas="someuser",
+                                    password="secret",
+                                    shell="cmd",
+                                    python_shell=False,
+                                )
+    shlex_split.assert_not_called()
+    assert "skip_shlex_check" in win_runas_mock.call_args[0][0]
+
+
 def test_run_with_tuple():
     """
     Tests return when cmd is a tuple
@@ -156,7 +284,11 @@ def test_run_with_tuple():
         with patch("salt.utils.platform.is_windows", MagicMock(return_value=False)):
             with patch("os.path.isfile", mock_true):
                 with patch("os.access", mock_true):
-                    cmdmod._run(("echo", "foo"), python_shell=True, cwd="/")
+                    # Python 3.13's ntpath.isabs rejects ``/`` (and ``\``) on
+                    # Windows; patch around it so this test exercises the
+                    # tuple-cmd path regardless of host platform.
+                    with patch("os.path.isabs", mock_true):
+                        cmdmod._run(("echo", "foo"), python_shell=True, cwd="/")
 
 
 def test_run_user_not_available():
@@ -169,6 +301,87 @@ def test_run_user_not_available():
             with patch("os.access", mock_true):
                 with pytest.raises(CommandExecutionError):
                     cmdmod._run("foo", "bar", runas="baz")
+
+
+@pytest.mark.skip_on_windows
+def test_run_runas_env_retrieval_timeout(caplog):
+    """
+    Regression test for issue #63901 / PR #63912.
+
+    When ``runas`` is supplied, ``_run`` shells out to fetch the user's
+    environment by piping a Python snippet through ``su``/``sudo`` and
+    reading the result back with ``subprocess.Popen.communicate()``. On
+    misconfigured PAM stacks (e.g. WINBIND), that subprocess can hang
+    indefinitely.
+
+    The fix adds ``timeout=10`` to that ``communicate()`` call and routes
+    a ``subprocess.TimeoutExpired`` into the existing "Environment could
+    not be retrieved" branch so execution continues with an empty
+    runas env rather than wedging the minion.
+
+    This test pins that behavior: the ``TimeoutExpired`` is swallowed,
+    the documented log.error is emitted, and ``_run`` proceeds to
+    invoke the actual command via ``TimedProc`` instead of raising.
+    """
+    import subprocess as _subprocess
+
+    mock_true = MagicMock(return_value=True)
+
+    # subprocess.Popen used for env retrieval; .communicate() must raise
+    # TimeoutExpired to drive the new except branch.
+    env_popen_instance = MagicMock()
+    env_popen_instance.communicate.side_effect = _subprocess.TimeoutExpired(
+        cmd=["su", "-", "baz", "-c"], timeout=10
+    )
+    env_popen_cls = MagicMock(return_value=env_popen_instance)
+
+    # After env retrieval falls back to empty env, the actual command runs
+    # via salt.utils.timed_subprocess.TimedProc -- mock that out so the
+    # test does not execute a real subprocess.
+    mock_timed_proc = MockTimedProc(stdout=b"ok\n", stderr=b"")
+
+    # pwd.getpwnam must succeed so the runas user is considered valid.
+    fake_pw = MagicMock(pw_name="baz", pw_shell="/bin/sh")
+
+    with patch("salt.modules.cmdmod._is_valid_shell", mock_true), patch(
+        "salt.utils.platform.is_windows", MagicMock(return_value=False)
+    ), patch("os.path.isfile", mock_true), patch("os.access", mock_true), patch(
+        "os.path.isabs", mock_true
+    ), patch(
+        "os.path.isdir", mock_true
+    ), patch(
+        "pwd.getpwnam", MagicMock(return_value=fake_pw)
+    ), patch(
+        "pwd.getpwall", MagicMock(return_value=[fake_pw])
+    ), patch(
+        "salt.utils.pkg.check_bundled", MagicMock(return_value=False)
+    ), patch.dict(
+        cmdmod.__grains__, {"os": "Linux", "os_family": "Debian"}, clear=False
+    ), patch(
+        "subprocess.Popen", env_popen_cls
+    ), patch(
+        "salt.utils.timed_subprocess.TimedProc",
+        MagicMock(return_value=mock_timed_proc),
+    ):
+        with caplog.at_level(logging.ERROR, logger="salt.modules.cmdmod"):
+            # Must not raise; TimeoutExpired must be caught inside _run.
+            ret = cmdmod._run("echo hi", "bar", runas="baz", python_shell=True)
+
+    # The fix routes the TimeoutExpired into the existing "Environment
+    # could not be retrieved" error log.
+    assert any(
+        "Environment could not be retrieved for user" in record.getMessage()
+        and "baz" in record.getMessage()
+        for record in caplog.records
+    ), (
+        "Expected 'Environment could not be retrieved' log.error to fire "
+        "when env-retrieval subprocess times out; got: "
+        f"{[r.getMessage() for r in caplog.records]}"
+    )
+
+    # Sanity: _run returned the dict shape callers expect (no exception
+    # propagated past the timeout handler).
+    assert isinstance(ret, dict)
 
 
 def test_run_zero_umask():
@@ -234,13 +447,17 @@ def test_run_no_vt_os_error():
         with patch("salt.utils.platform.is_windows", MagicMock(return_value=False)):
             with patch("os.path.isfile", MagicMock(return_value=True)):
                 with patch("os.access", MagicMock(return_value=True)):
-                    with patch(
-                        "salt.utils.timed_subprocess.TimedProc",
-                        MagicMock(side_effect=OSError(expected_error)),
-                    ):
-                        with pytest.raises(CommandExecutionError) as error:
-                            cmdmod.run("foo", cwd="/")
-                        assert error.value.args[0].endswith(expected_error)
+                    # Python 3.13's ntpath.isabs rejects ``/`` on Windows; patch
+                    # so the cwd validation does not preempt the OSError path
+                    # we are exercising.
+                    with patch("os.path.isabs", MagicMock(return_value=True)):
+                        with patch(
+                            "salt.utils.timed_subprocess.TimedProc",
+                            MagicMock(side_effect=OSError(expected_error)),
+                        ):
+                            with pytest.raises(CommandExecutionError) as error:
+                                cmdmod.run("foo", cwd="/")
+                            assert error.value.args[0].endswith(expected_error)
 
 
 def test_run_no_vt_io_error():
@@ -252,13 +469,88 @@ def test_run_no_vt_io_error():
         with patch("salt.utils.platform.is_windows", MagicMock(return_value=False)):
             with patch("os.path.isfile", MagicMock(return_value=True)):
                 with patch("os.access", MagicMock(return_value=True)):
+                    # Python 3.13's ntpath.isabs rejects ``/`` on Windows; patch
+                    # so the cwd validation does not preempt the IOError path
+                    # we are exercising.
+                    with patch("os.path.isabs", MagicMock(return_value=True)):
+                        with patch(
+                            "salt.utils.timed_subprocess.TimedProc",
+                            MagicMock(side_effect=IOError(expected_error)),
+                        ):
+                            with pytest.raises(CommandExecutionError) as error:
+                                cmdmod.run("foo", cwd="/")
+                            assert error.value.args[0].endswith(expected_error)
+
+
+# ---------------------------------------------------------------------------
+# Secret-leak guard for the OSError path above.
+#
+# When ``TimedProc`` raises ``OSError`` (typically ``ENOENT`` because the
+# binary does not exist) the handler builds a ``CommandExecutionError``
+# whose message is meant to help the operator debug. Historically the
+# entire ``new_kwargs`` dict was interpolated into that message, which
+# leaked two routinely-secret-bearing fields:
+#
+# * ``env`` — the run environment, set by callers via
+#   ``cmd.run env={'DB_PASSWORD': '...'}`` or by states that pass
+#   credentials through env vars.
+# * ``stdin`` — the bytes piped to the command, commonly used to feed
+#   a password to a CLI like ``mysql -p``.
+#
+# Both leak channels matter: the resulting ``CommandExecutionError`` ends
+# up in master/minion logs *and* in event-bus return data visible to the
+# API caller. ENOENT is not a rare condition; it fires on any typo in a
+# binary path. A typo should not exfiltrate credentials.
+# ---------------------------------------------------------------------------
+
+
+def test_run_oserror_message_does_not_leak_env_secrets():
+    """``cmd.run`` with an env-var holding a credential must not include
+    that credential in the ``CommandExecutionError`` raised when the
+    underlying ``TimedProc`` raises ``OSError`` (e.g. binary not
+    found)."""
+    secret_marker = "s3cr3t-do-not-log"
+    with patch("salt.modules.cmdmod._is_valid_shell", MagicMock(return_value=True)):
+        with patch("salt.utils.platform.is_windows", MagicMock(return_value=False)):
+            with patch("os.path.isfile", MagicMock(return_value=True)):
+                with patch("os.access", MagicMock(return_value=True)):
                     with patch(
                         "salt.utils.timed_subprocess.TimedProc",
-                        MagicMock(side_effect=IOError(expected_error)),
+                        MagicMock(side_effect=OSError("no such file")),
                     ):
                         with pytest.raises(CommandExecutionError) as error:
-                            cmdmod.run("foo", cwd="/")
-                        assert error.value.args[0].endswith(expected_error)
+                            cmdmod.run(
+                                "foo",
+                                cwd="/",
+                                env={"DB_PASSWORD": secret_marker},
+                            )
+    assert secret_marker not in error.value.args[0], (
+        "CommandExecutionError raised on OSError leaks an env-var value "
+        "into its message; that message ends up in logs and in API "
+        "event-bus return data."
+    )
+
+
+def test_run_oserror_message_does_not_leak_stdin():
+    """``cmd.run`` with a password piped via ``stdin`` must not include
+    that stdin payload in the ``CommandExecutionError`` raised on
+    ``OSError``."""
+    stdin_marker = "stdin-secret-do-not-log"
+    with patch("salt.modules.cmdmod._is_valid_shell", MagicMock(return_value=True)):
+        with patch("salt.utils.platform.is_windows", MagicMock(return_value=False)):
+            with patch("os.path.isfile", MagicMock(return_value=True)):
+                with patch("os.access", MagicMock(return_value=True)):
+                    with patch(
+                        "salt.utils.timed_subprocess.TimedProc",
+                        MagicMock(side_effect=OSError("no such file")),
+                    ):
+                        with pytest.raises(CommandExecutionError) as error:
+                            cmdmod.run("foo", cwd="/", stdin=stdin_marker)
+    assert stdin_marker not in error.value.args[0], (
+        "CommandExecutionError raised on OSError leaks the stdin "
+        "payload into its message; stdin is a common channel for "
+        "passing a password to a child process."
+    )
 
 
 @pytest.mark.skip(reason="Test breaks unittests runs")
@@ -294,7 +586,7 @@ def test_powershell_empty():
     mock_run = {"pid": 1234, "retcode": 0, "stderr": "", "stdout": ""}
     with patch("salt.modules.cmdmod._run", return_value=mock_run):
         ret = cmdmod.powershell("Set-ExecutionPolicy RemoteSigned")
-        assert ret == {}
+        assert ret == ""
 
 
 def test_is_valid_shell_windows():
@@ -369,6 +661,47 @@ def test_os_environment_remains_intact():
                     getpwnam_mock.assert_called_with("foobar")
 
 
+@pytest.mark.skip_on_windows
+def test_os_environment_do_not_pass_notify_socket():
+    """
+    Make sure NOTIFY_SOCKET environment variable is not passed
+    to the command if not explicitly set with env parameter.
+    """
+    with patch("pwd.getpwnam") as getpwnam_mock:
+        new_env = os.environ.copy()
+        new_env.update({"NOTIFY_SOCKET": "/run/systemd/notify"})
+        with patch("subprocess.Popen") as popen_mock, patch(
+            "os.environ.copy", return_value=new_env
+        ):
+            popen_mock.return_value = Mock(
+                communicate=lambda *args, **kwags: [b"", None],
+                pid=lambda: 1,
+                retcode=0,
+            )
+
+            with patch.dict(cmdmod.__grains__, {"os": "SUSE", "os_family": "Suse"}):
+                if sys.platform.startswith(("freebsd", "openbsd")):
+                    shell = "/bin/sh"
+                else:
+                    shell = "/bin/bash"
+
+                cmdmod._run("ls", cwd=tempfile.gettempdir(), shell=shell)
+
+                assert "NOTIFY_SOCKET" not in popen_mock.call_args_list[0][1]["env"]
+
+                cmdmod._run(
+                    "ls",
+                    cwd=tempfile.gettempdir(),
+                    shell=shell,
+                    env={"NOTIFY_SOCKET": "/run/systemd/notify.new"},
+                )
+
+                assert (
+                    popen_mock.call_args_list[1][1]["env"]["NOTIFY_SOCKET"]
+                    == "/run/systemd/notify.new"
+                )
+
+
 @pytest.mark.skip_unless_on_darwin
 def test_shell_properly_handled_on_macOS():
     """
@@ -398,25 +731,28 @@ def test_shell_properly_handled_on_macOS():
 
             # User default shell is '/usr/local/bin/bash'
             user_default_shell = "/usr/local/bin/bash"
-            with patch.dict(
-                cmdmod.__salt__,
-                {"user.info": MagicMock(return_value={"shell": user_default_shell})},
+            with patch(
+                "pwd.getpwall",
+                Mock(
+                    return_value=[Mock(pw_shell=user_default_shell, pw_name="foobar")]
+                ),
             ):
-
                 cmd_handler.clear()
                 cmdmod._run(
                     "ls", cwd=tempfile.gettempdir(), runas="foobar", use_vt=False
                 )
 
                 assert re.search(
-                    "{} -l -c".format(user_default_shell), cmd_handler.cmd
+                    f"{user_default_shell} -l -c", cmd_handler.cmd
                 ), "cmd invokes right bash session on macOS"
 
             # User default shell is '/bin/zsh'
             user_default_shell = "/bin/zsh"
-            with patch.dict(
-                cmdmod.__salt__,
-                {"user.info": MagicMock(return_value={"shell": user_default_shell})},
+            with patch(
+                "pwd.getpwall",
+                Mock(
+                    return_value=[Mock(pw_shell=user_default_shell, pw_name="foobar")]
+                ),
             ):
 
                 cmd_handler.clear()
@@ -427,6 +763,37 @@ def test_shell_properly_handled_on_macOS():
                 assert not re.search(
                     "bash -l -c", cmd_handler.cmd
                 ), "cmd does not invoke user shell on macOS"
+
+
+@pytest.mark.skip_on_windows
+def test_run_all_quiet_does_not_depend_on_salt_dunder():
+    """
+    `cmdmod._run_all_quiet` should not depend on availability
+    of __salt__ dictionary (issue #61816).
+
+    This test checks for __salt__ specifically and will still
+    pass if other dunders, especially __grains__, are referenced.
+    This is the case on UNIX systems other than MacOS when
+    `sudo` could not be found.
+    """
+
+    proc = MagicMock(return_value=MockTimedProc(stdout=b"success", stderr=None))
+    runas = getpass.getuser()
+
+    with patch.dict(cmdmod.__grains__, {"os": "Darwin", "os_family": "Solaris"}):
+        with patch("salt.utils.timed_subprocess.TimedProc", proc):
+            salt_dunder_mock = MagicMock(spec_set=dict)
+            salt_dunder_mock.__getitem__.side_effect = NameError(
+                "__salt__ might not be defined"
+            )
+
+            with patch.object(cmdmod, "__salt__", salt_dunder_mock):
+                ret = cmdmod._run_all_quiet("foo")
+                assert ret["stdout"] == "success"
+                assert salt_dunder_mock.__getitem__.call_count == 0
+                ret = cmdmod._run_all_quiet("foo", runas=runas)
+                assert ret["stdout"] == "success"
+                assert salt_dunder_mock.__getitem__.call_count == 0
 
 
 def test_run_cwd_doesnt_exist_issue_7154():
@@ -468,10 +835,6 @@ def test_run_all_binary_replace():
     with salt.utils.files.fopen(rand_bytes_file, "rb") as fp_:
         stdout_bytes = fp_.read()
 
-    # kitchen-salt uses unix2dos on all the files before copying them over
-    # to the vm that will be running the tests. It skips binary files though
-    # The file specified in `rand_bytes_file` is detected as binary so the
-    # Unix-style line ending remains. This should account for that.
     stdout_bytes = stdout_bytes.rstrip() + os.linesep.encode()
 
     # stdout with the non-decodable bits replaced with the unicode
@@ -578,11 +941,20 @@ def test_run_all_output_loglevel_debug(caplog):
     stdout = b"test"
     proc = MagicMock(return_value=MockTimedProc(stdout=stdout))
 
-    msg = "Executing command 'some' in directory"
+    # When we get back to having to specify a shell, we may need to change this
+    # back.
+    # if salt.utils.platform.is_windows():
+    #     run_cmd = salt.utils.path.which("cmd")
+    #     expected = f"Executing command '{run_cmd}' in directory"
+    # else:
+    #     expected = "Executing command 'some' in directory"
+    expected = "Executing command 'some' in directory"
+
     with patch("salt.utils.timed_subprocess.TimedProc", proc):
         with caplog.at_level(logging.DEBUG, logger="salt.modules.cmdmod"):
             ret = cmdmod.run_all("some command", output_loglevel="debug")
-        assert msg in caplog.text
+        result = caplog.text
+        assert expected.lower() in result.lower()
 
     assert ret["stdout"] == salt.utils.stringutils.to_unicode(stdout)
 
@@ -644,7 +1016,7 @@ def test_run_chroot_runas():
         python_shell=True,
         reset_system_locale=True,
         rstrip=True,
-        saltenv="base",
+        saltenv=None,
         shell="/bin/sh",
         stdin=None,
         success_retcodes=None,
@@ -693,3 +1065,447 @@ def test_log_cmd_non_str_tuple_list():
             return self.cmd
 
     assert cmdmod._log_cmd(cmd("foo bar")) == "foo"
+
+
+@pytest.mark.skip_on_windows
+def test_cmd_script_saltenv_from_config():
+    mock_cp_get_template = MagicMock()
+    mock_cp_cache_file = MagicMock()
+    mock_run = MagicMock()
+    with patch.dict(cmdmod.__opts__, {"saltenv": "base"}):
+        with patch.dict(
+            cmdmod.__salt__,
+            {
+                "cp.cache_file": mock_cp_cache_file,
+                "cp.get_template": mock_cp_get_template,
+                "file.user_to_uid": MagicMock(),
+                "file.remove": MagicMock(),
+            },
+        ):
+            with patch("salt.modules.cmdmod._run") as mock_run:
+                with patch("shutil.copyfile", MagicMock()):
+                    with patch("os.chmod", MagicMock()):
+                        with patch("os.chown", MagicMock()):
+                            cmdmod.script("test")
+                            assert mock_cp_cache_file.call_count == 1
+                            mock_cp_cache_file.assert_called_with("test", "base")
+                            assert mock_run.call_count == 1
+                            assert mock_run.call_args[1]["saltenv"] == "base"
+                            cmdmod.script("test", template="jinja")
+                            assert mock_cp_get_template.call_count == 1
+                            assert mock_cp_get_template.call_args[0][3] == "base"
+                            assert mock_run.call_count == 2
+                            assert mock_run.call_args[1]["saltenv"] == "base"
+
+
+@pytest.mark.skip_unless_on_windows
+def test_cmd_script_saltenv_from_config_windows():
+    mock_cp_get_template = MagicMock()
+    mock_cp_cache_file = MagicMock()
+    with patch.dict(cmdmod.__opts__, {"saltenv": "base"}):
+        with patch.dict(
+            cmdmod.__salt__,
+            {
+                "cp.cache_file": mock_cp_cache_file,
+                "cp.get_template": mock_cp_get_template,
+                "file.remove": MagicMock(),
+            },
+        ):
+            with patch("salt.modules.cmdmod._run") as mock_run:
+                with patch("shutil.copyfile", MagicMock()):
+                    cmdmod.script("test")
+                    assert mock_cp_cache_file.call_count == 1
+                    mock_cp_cache_file.assert_called_with("test", "base")
+                    assert mock_run.call_count == 1
+                    assert mock_run.call_args[1]["saltenv"] == "base"
+                    cmdmod.script("test", template="jinja")
+                    assert mock_cp_get_template.call_count == 1
+                    assert mock_cp_get_template.call_args[0][3] == "base"
+                    assert mock_run.call_count == 2
+                    assert mock_run.call_args[1]["saltenv"] == "base"
+
+
+def test_cmd_script_runas_domain_user_windows_68578(tmp_path, caplog):
+    """
+    Regression test for #68578.
+
+    On Windows ``cmd.script`` used to abort with ``Invalid user: <runas>``
+    whenever the ``user.info`` precheck returned an empty dict. ``user.info``
+    (NetUserGetInfo) only sees local-machine accounts, so domain users
+    (``DOMAIN\\user``, ``user@DOMAIN``, SIDs) were rejected even though the
+    underlying ``win_runas`` machinery can authenticate them.
+
+    The precheck must not abort execution when ``user.info`` returns empty;
+    instead the script should proceed and let ``win_runas`` raise a precise
+    error if the user is truly invalid.
+    """
+    mock_cp_cache_file = MagicMock(return_value="fnord")
+    with patch.dict(cmdmod.__opts__, {"saltenv": "base", "cachedir": str(tmp_path)}):
+        with patch.dict(
+            cmdmod.__salt__,
+            {
+                "cp.cache_file": mock_cp_cache_file,
+                "file.remove": MagicMock(),
+                # user.info returns {} for domain users on Windows when the
+                # local SAM and DC lookups can't resolve the account; the
+                # precheck must not treat that as a fatal error.
+                "user.info": MagicMock(return_value={}),
+            },
+        ):
+            with patch("salt.utils.platform.is_windows", return_value=True):
+                with patch(
+                    "salt.utils.win_dacl.set_permissions", MagicMock(create=True)
+                ):
+                    with patch("salt.modules.cmdmod._run") as mock_run:
+                        mock_run.return_value = {
+                            "pid": 1,
+                            "retcode": 0,
+                            "stdout": "",
+                            "stderr": "",
+                        }
+                        with patch("shutil.copyfile", MagicMock()):
+                            cmdmod.script("salt://test.ps1", runas="DOMAIN\\someuser")
+                            assert mock_run.call_count == 1
+
+
+@pytest.mark.parametrize("bundled", [True, False])
+@pytest.mark.parametrize(
+    "test_os,test_family",
+    [
+        ("FreeBSD", "FreeBSD"),
+        ("linux", "Solaris"),
+        ("linux", "AIX"),
+        ("linux", "linux"),
+    ],
+)
+@pytest.mark.skip_on_darwin
+@pytest.mark.skip_on_windows
+def test_runas_env_all_os(test_os, test_family, bundled):
+    """
+    cmd.run executes command and the environment is returned
+    when the runas parameter is specified
+    on all different OS types and os_family
+    """
+    with patch("pwd.getpwnam") as getpwnam_mock:
+        with patch("subprocess.Popen") as popen_mock:
+            popen_mock.return_value = Mock(
+                communicate=lambda *args, **kwags: [b"", None],
+                pid=lambda: 1,
+                retcode=0,
+            )
+            file_name = "/tmp/doesnotexist"
+
+            with patch.dict(
+                cmdmod.__grains__, {"os": test_os, "os_family": test_family}
+            ):
+                with patch("salt.utils.pkg.check_bundled", return_value=bundled):
+                    with patch("shutil.chown"):
+                        with patch("os.remove"):
+                            with patch.object(
+                                tempfile, "NamedTemporaryFile"
+                            ) as mock_fp:
+                                mock_fp.return_value.__enter__.return_value.name = (
+                                    file_name
+                                )
+                                if sys.platform.startswith(("freebsd", "openbsd")):
+                                    shell = "/bin/sh"
+                                else:
+                                    shell = "/bin/bash"
+                                _user = "foobar"
+                                cmdmod._run(
+                                    "ls",
+                                    cwd=tempfile.gettempdir(),
+                                    runas=_user,
+                                    shell=shell,
+                                )
+                                if not bundled:
+                                    if test_family in ("Solaris", "AIX"):
+                                        env_cmd = ["su", "-", _user, "-c"]
+                                    elif test_os == "FreeBSD":
+                                        env_cmd = ["su", "-", _user, "-c"]
+                                    else:
+                                        env_cmd = [
+                                            "su",
+                                            "-s",
+                                            shell,
+                                            "-",
+                                            _user,
+                                            "-c",
+                                        ]
+                                    if test_os == "FreeBSD":
+                                        env_cmd.extend([f"{shell} -c {sys.executable}"])
+                                    else:
+                                        env_cmd.extend([sys.executable])
+                                    assert popen_mock.call_args_list[0][0][0] == env_cmd
+                                else:
+                                    if test_family in ("Solaris", "AIX"):
+                                        env_cmd = ["su", "-", _user, "-c"]
+                                    elif test_os == "FreeBSD":
+                                        env_cmd = ["su", "-", _user, "-c"]
+                                    else:
+                                        env_cmd = [
+                                            "su",
+                                            "-s",
+                                            shell,
+                                            "-",
+                                            _user,
+                                            "-c",
+                                        ]
+                                    if test_os == "FreeBSD":
+                                        env_cmd.extend(
+                                            [
+                                                "{} -c {} python {}".format(
+                                                    shell, sys.executable, file_name
+                                                )
+                                            ]
+                                        )
+                                    else:
+                                        env_cmd.extend(
+                                            [
+                                                "{} python {}".format(
+                                                    sys.executable, file_name
+                                                )
+                                            ]
+                                        )
+                                    assert popen_mock.call_args_list[0][0][0] == env_cmd
+
+
+@pytest.mark.skip_on_darwin
+@pytest.mark.skip_on_windows
+@pytest.mark.parametrize("bundled", [True, False])
+def test_runas_env_sudo_group(bundled):
+    """
+    cmd.run executes command and the environment is returned
+    when the runas parameter is specified
+    when group is passed and use_sudo=True
+    """
+    with patch("pwd.getpwnam") as getpwnam_mock:
+        with patch("subprocess.Popen") as popen_mock:
+            popen_mock.return_value = Mock(
+                communicate=lambda *args, **kwags: [b"", None],
+                pid=lambda: 1,
+                retcode=0,
+            )
+            file_name = "/tmp/doesnotexist"
+
+            with patch.dict(cmdmod.__grains__, {"os": "linux", "os_family": "linux"}):
+                with patch("grp.getgrnam"):
+                    with patch("salt.utils.pkg.check_bundled", return_value=bundled):
+                        with patch("shutil.chown"):
+                            with patch("os.remove"):
+                                with patch.object(
+                                    tempfile, "NamedTemporaryFile"
+                                ) as mock_fp:
+                                    mock_fp.return_value.__enter__.return_value.name = (
+                                        file_name
+                                    )
+                                    if sys.platform.startswith(("freebsd", "openbsd")):
+                                        shell = "/bin/sh"
+                                    else:
+                                        shell = "/bin/bash"
+                                    _user = "foobar"
+                                    _group = "foobar"
+                                    same_shell = False
+                                    if salt.grains.extra.shell()["shell"] == shell:
+                                        same_shell = True
+
+                                    cmdmod._run(
+                                        "ls",
+                                        cwd=tempfile.gettempdir(),
+                                        runas=_user,
+                                        shell=shell,
+                                        group=_group,
+                                    )
+                                    if not bundled:
+                                        exp_ret = [
+                                            "sudo",
+                                            "-u",
+                                            _user,
+                                            "-g",
+                                            _group,
+                                            "-s",
+                                            "--",
+                                            shell,
+                                            "-c",
+                                            sys.executable,
+                                        ]
+                                        if same_shell:
+                                            exp_ret = [
+                                                "sudo",
+                                                "-u",
+                                                _user,
+                                                "-g",
+                                                _group,
+                                                "-i",
+                                                "--",
+                                                sys.executable,
+                                            ]
+                                        assert (
+                                            popen_mock.call_args_list[0][0][0]
+                                            == exp_ret
+                                        )
+                                    else:
+                                        exp_ret = [
+                                            "sudo",
+                                            "-u",
+                                            _user,
+                                            "-g",
+                                            _group,
+                                            "-s",
+                                            "--",
+                                            shell,
+                                            "-c",
+                                            "{} python {}".format(
+                                                sys.executable, file_name
+                                            ),
+                                        ]
+                                        if same_shell:
+                                            exp_ret = [
+                                                "sudo",
+                                                "-u",
+                                                _user,
+                                                "-g",
+                                                _group,
+                                                "-i",
+                                                "--",
+                                                "{} python {}".format(
+                                                    sys.executable, file_name
+                                                ),
+                                            ]
+                                        assert (
+                                            popen_mock.call_args_list[0][0][0]
+                                            == exp_ret
+                                        )
+
+
+@pytest.mark.skip_unless_on_windows
+def test__run_no_powershell():
+    with pytest.raises(CommandExecutionError):
+        cmdmod._run(shell="unk_bin", cmd="Some-Command", encoded_cmd=False)
+
+
+@pytest.mark.parametrize(
+    "cmd, parsed",
+    [
+        ("Write-Host foo", "Write-Host foo"),
+        ("& Write-Host foo", "& Write-Host foo"),
+        ("$PSVersionTable", "$PSVersionTable"),
+        ("try {this} catch {that}", "try {this} catch {that}"),
+        ("[bool]@{value = 0}", "[bool]@{value = 0}"),
+        (
+            "(Get-Date(Get-Date).ToUniversalTime() -UFormat %s)",
+            "(Get-Date(Get-Date).ToUniversalTime() -UFormat %s)",
+        ),
+        (
+            "if (1 -eq 1) { exit 0 } else { exit 1 }",
+            "if (1 -eq 1) { exit 0 } else { exit 1 }",
+        ),
+        (
+            "do { $count++; $a++; } while ($x[$a] -ne 0)",
+            "do { $count++; $a++; } while ($x[$a] -ne 0)",
+        ),
+        (
+            "while ($val -ne 3) { $val++; Write-Host $val }",
+            "while ($val -ne 3) { $val++; Write-Host $val }",
+        ),
+        (
+            "trap { 'Error found.' }",
+            "trap { 'Error found.' }",
+        ),
+        (
+            "for ($i=1; $i -le 10; $i++) { Write-Host $i }",
+            "for ($i=1; $i -le 10; $i++) { Write-Host $i }",
+        ),
+        (
+            "foreach ($file in Get-ChildItem) { Write-Host $file }",
+            "foreach ($file in Get-ChildItem) { Write-Host $file }",
+        ),
+        (
+            'data { if ($null) { "To get help for this cmdlet, type Get-Help New-Dictionary." } }',
+            'data { if ($null) { "To get help for this cmdlet, type Get-Help New-Dictionary." } }',
+        ),
+    ],
+)
+@pytest.mark.skip_unless_on_windows
+def test_prep_powershell_cmd(cmd, parsed):
+    """
+    Tests _prep_powershell_cmd returns correct cmd
+    """
+    ret = cmdmod._prep_powershell_cmd(
+        win_shell="powershell.exe", cmd=cmd, encoded_cmd=False
+    )
+    expected = [
+        "powershell.exe",
+        "-NonInteractive",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        parsed,
+    ]
+    assert ret == expected
+
+
+@pytest.mark.skip_unless_on_windows
+def test_prep_powershell_cmd_encoded():
+    """
+    Tests _prep_powershell_cmd returns correct cmd when encoded_cmd=True
+    """
+    # This is the encoded command for 'Write-Host "Encoded HOLO"'
+    e_cmd = "VwByAGkAdABlAC0ASABvAHMAdAAgACIARQBuAGMAbwBkAGUAZAAgAEgATwBMAE8AIgA="
+    ret = cmdmod._prep_powershell_cmd(
+        win_shell="powershell.exe", cmd=e_cmd, encoded_cmd=True
+    )
+    expected = [
+        "powershell.exe",
+        "-NonInteractive",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        e_cmd,
+    ]
+    assert ret == expected
+
+
+@pytest.mark.skip_unless_on_windows
+def test_prep_powershell_cmd_script():
+    """
+    Tests _prep_powershell_cmd returns correct cmd when called from cmd.script
+    """
+    stack = [["", "", ""], ["", "", "script"], ["", "", ""], ["", "", ""]]
+    with patch("traceback.extract_stack", return_value=stack), patch(
+        "salt.utils.path.which", return_value="powershell.exe"
+    ):
+        script = r"C:\some\script.ps1"
+        ret = cmdmod._prep_powershell_cmd(
+            win_shell="powershell.exe", cmd=[script], encoded_cmd=False
+        )
+        expected = [
+            "powershell.exe",
+            "-NonInteractive",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script,
+        ]
+        assert ret == expected
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("", '""'),  # Should quote an empty string
+        ("Foo", '"Foo"'),  # Should quote a string
+        ('["foo", "bar"]', '["foo", "bar"]'),  # Should leave unchanged
+        ('{"foo": "bar"}', '{"foo": "bar"}'),  # Should leave unchanged
+    ],
+)
+@pytest.mark.skip_unless_on_windows
+def test_prep_powershell_json(text, expected):
+    """
+    Make sure the output is valid json
+    """
+    result = cmdmod._prep_powershell_json(text)
+    assert result == expected

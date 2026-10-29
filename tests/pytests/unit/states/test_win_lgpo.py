@@ -1,32 +1,33 @@
 """
 :codeauthor: Shane Lee <slee@saltstack.com>
 """
+
 import copy
 
 import pytest
+
 import salt.config
 import salt.loader
 import salt.states.win_lgpo as win_lgpo
 import salt.utils.platform
 import salt.utils.stringutils
-from tests.support.mock import patch
+from tests.support.mock import MagicMock, patch
 
 
 @pytest.fixture
-def configure_loader_modules():
-    opts = salt.config.DEFAULT_MINION_OPTS.copy()
-    utils = salt.loader.utils(opts)
-    modules = salt.loader.minion_mods(opts, utils=utils)
+def configure_loader_modules(minion_opts):
+    utils = salt.loader.utils(minion_opts)
+    modules = salt.loader.minion_mods(minion_opts, utils=utils)
     return {
         win_lgpo: {
-            "__opts__": copy.deepcopy(opts),
+            "__opts__": copy.deepcopy(minion_opts),
             "__salt__": modules,
             "__utils__": utils,
         }
     }
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture
 def policy_clear():
     # Make sure policy is not set to begin with, unsets it after test
     try:
@@ -40,7 +41,7 @@ def policy_clear():
             win_lgpo.set_(name="test_state", computer_policy=computer_policy)
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture
 def policy_set():
     # Make sure policy is set to begin with, unsets it after test
     try:
@@ -202,25 +203,11 @@ def test_old_element_naming_style(policy_clear):
 
     with patch.dict(win_lgpo.__opts__, {"test": False}):
         result = win_lgpo.set_(name="test_state", computer_policy=computer_policy)
-    expected = {
-        "Point and Print Restrictions": {
-            "Enter fully qualified server names separated by semicolons": (
-                "fakeserver1;fakeserver2"
-            ),
-            "When installing drivers for a new connection": (
-                "Show warning and elevation prompt"
-            ),
-            "Users can only point and print to machines in their forest": True,
-            "Users can only point and print to these servers": True,
-            "When updating drivers for an existing connection": "Show warning only",
-        }
-    }
-    assert result["changes"]["new"]["Computer Configuration"] == expected
+    assert result["changes"] == {}
     expected = (
-        'The LGPO module changed the way it gets policy element names.\n"Security'
-        ' Prompts: When installing drivers for a new connection" is no longer'
-        ' valid.\nPlease use "When installing drivers for a new connection"'
-        " instead.\nThe following policies changed:\nPoint and Print Restrictions"
+        "The LGPO module changed the way it gets policy element names.\n"
+        '"Security Prompts: When installing drivers for a new connection" is no longer valid.\n'
+        'Please use "When installing drivers for a new connection" instead.'
     )
     assert result["comment"] == expected
 
@@ -311,14 +298,13 @@ def test_old_element_naming_style_true(policy_set):
     expected = {
         "changes": {},
         "comment": (
-            'The LGPO module changed the way it gets policy element names.\n"Security'
-            ' Prompts: When installing drivers for a new connection" is no longer'
-            ' valid.\nPlease use "When installing drivers for a new connection"'
-            " instead.\nAll specified policies are properly configured"
+            "The LGPO module changed the way it gets policy element names.\n"
+            '"Security Prompts: When installing drivers for a new connection" is no longer valid.\n'
+            'Please use "When installing drivers for a new connection" instead.'
         ),
     }
     assert result["changes"] == expected["changes"]
-    assert result["result"]
+    assert not result["result"]
     assert result["comment"] == expected["comment"]
 
 
@@ -348,3 +334,94 @@ def test_invalid_elements_true():
     assert "Invalid element squidward" in result["comment"]
     assert "Invalid element spongebob" in result["comment"]
     assert not expected["result"]
+
+
+def test__normalize_element_names_maps_aliases_to_element_id():
+    """
+    Element ids and ADML display names are interchangeable aliases. The
+    helper must rewrite both to the canonical ``element_id``.
+    """
+    policy_elements = [
+        {
+            "element_id": "StorageSenseCloudContentDehydrationThreshold",
+            "element_aliases": [
+                "StorageSenseCloudContentDehydrationThreshold",
+                (
+                    "Number of days since a cloud-backed file has been opened"
+                    " before Storage Sense will dehydrate it"
+                ),
+            ],
+        }
+    ]
+    # Element id key passes through unchanged.
+    assert win_lgpo._normalize_element_names(
+        {"StorageSenseCloudContentDehydrationThreshold": 7}, policy_elements
+    ) == {"StorageSenseCloudContentDehydrationThreshold": 7}
+    # Display name key is rewritten to the element id.
+    assert win_lgpo._normalize_element_names(
+        {
+            "Number of days since a cloud-backed file has been opened"
+            " before Storage Sense will dehydrate it": 7
+        },
+        policy_elements,
+    ) == {"StorageSenseCloudContentDehydrationThreshold": 7}
+    # Unknown key is left alone so the comparison still flags it.
+    assert win_lgpo._normalize_element_names({"Unknown": 1}, policy_elements) == {
+        "Unknown": 1
+    }
+    # Non-dict inputs are returned unchanged.
+    assert (
+        win_lgpo._normalize_element_names("Not Configured", policy_elements)
+        == "Not Configured"
+    )
+
+
+def test_set_idempotent_when_current_policy_keyed_by_display_name():
+    """
+    Regression test for #68489: ``lgpo.set`` succeeded on the first run but
+    failed on subsequent runs because the state compared a requested
+    dictionary keyed by element id with a current dictionary keyed by the
+    ADML display name. Even when ``lgpo.set`` reported success, the post-set
+    diff was empty and the state declared "Failed to set the following
+    policies".
+    """
+    policy_name = (
+        "System\\Storage Sense\\Configure Storage Sense Cloud Content"
+        " dehydration threshold"
+    )
+    element_id = "StorageSenseCloudContentDehydrationThreshold"
+    display_name = (
+        "Number of days since a cloud-backed file has been opened before"
+        " Storage Sense will dehydrate it"
+    )
+    computer_policy = {policy_name: {element_id: 7}}
+    lookup = {
+        "policy_found": True,
+        "policy_aliases": [policy_name],
+        "rights_assignment": False,
+        "policy_elements": [
+            {
+                "element_id": element_id,
+                "element_aliases": [element_id, display_name],
+            }
+        ],
+        "message": "",
+    }
+    # Current policy comes back keyed by the display name (what
+    # lgpo.get_policy returns when return_full_policy_names=True).
+    current_value = {display_name: 7}
+    salt_mock = {
+        "lgpo.get_policy_info": MagicMock(return_value=lookup),
+        "lgpo.get_policy": MagicMock(return_value=current_value),
+        "lgpo.set": MagicMock(return_value=True),
+        "lgpo.clear_policy_cache": MagicMock(return_value=None),
+    }
+    with patch.dict(win_lgpo.__salt__, salt_mock), patch.dict(
+        win_lgpo.__opts__, {"test": False}
+    ):
+        result = win_lgpo.set_(name="test_state", computer_policy=computer_policy)
+    # Already set means no changes, no failure, and lgpo.set is not invoked.
+    assert result["result"] is True, result
+    assert result["changes"] == {}
+    assert "Failed to set" not in result["comment"]
+    assert salt_mock["lgpo.set"].call_count == 0

@@ -9,11 +9,21 @@ import salt.beacons.network_settings as network_settings
 from tests.support.mock import MagicMock, patch
 
 try:
+    # ipdb_interfaces_view requires pyroute2 >= 0.7.1
+    from pyroute2 import NDB
+    from pyroute2.ndb.compat import ipdb_interfaces_view
+
+    HAS_NDB = True
+except ImportError:
+    HAS_NDB = False
+
+try:
+    # IPDB support may be dropped in future pyroute2 releases
     from pyroute2 import IPDB
 
-    HAS_PYROUTE2 = True
+    HAS_IPDB = True
 except ImportError:
-    HAS_PYROUTE2 = False
+    HAS_IPDB = False
 
 
 log = logging.getLogger(__name__)
@@ -141,8 +151,54 @@ def test_wildcard_interface():
         assert ret == _expected
 
 
-@pytest.mark.skipif(HAS_PYROUTE2 is False, reason="no pyroute2 installed, skipping")
-def test_interface_dict_fields():
+def test_ephemeral_interface_no_keyerror():
+    """
+    Beacon must not raise KeyError when a new interface appears between calls.
+
+    LAST_STATS is seeded from the first beacon() call. If an interface comes
+    up afterwards (ephemeral bridge, WireGuard tunnel, hotplug NIC), it will
+    be present in _stats but absent from LAST_STATS. Without the guard added
+    in #64584 the set-difference ``_stats[iface] - LAST_STATS[iface]`` raises
+    a KeyError.
+    """
+    config = [{"interfaces": {"eth*": {"promiscuity": None}}}]
+
+    # First call: only eth0 exists.
+    INITIAL_STATS = network_settings._copy_interfaces_info(
+        {"eth0": {"family": "0", "promiscuity": "0", "group": "0"}}
+    )
+    # Second call: eth1 has appeared (ephemeral addition).
+    AFTER_STATS = network_settings._copy_interfaces_info(
+        {
+            "eth0": {"family": "0", "promiscuity": "0", "group": "0"},
+            "eth1": {"family": "0", "promiscuity": "0", "group": "0"},
+        }
+    )
+
+    ret = network_settings.validate(config)
+    assert ret == (True, "Valid beacon configuration")
+
+    with patch.object(network_settings, "LAST_STATS", {}), patch.object(
+        network_settings, "IP", MockIPClass
+    ), patch(
+        "salt.beacons.network_settings._copy_interfaces_info",
+        MagicMock(side_effect=[INITIAL_STATS, AFTER_STATS]),
+    ):
+        # First call seeds LAST_STATS with eth0 only; no events expected.
+        ret = network_settings.beacon(config)
+        assert ret == []
+
+        # Second call: eth1 is new — must not raise KeyError; eth1 fires an
+        # event because all of its attrs are "new" relative to the empty seed.
+        ret = network_settings.beacon(config)
+        assert isinstance(ret, list)
+        assert not any(isinstance(item, Exception) for item in ret)
+        tags = [item["tag"] for item in ret]
+        assert "eth1" in tags
+
+
+@pytest.mark.skipif(HAS_IPDB is False, reason="pyroute2.IPDB not available, skipping")
+def test_interface_dict_fields_old():
     with IPDB() as ipdb:
         for attr in network_settings.ATTRS:
             # ipdb.interfaces is a dict-like object, that
@@ -152,3 +208,31 @@ def test_interface_dict_fields():
             # ipdb.interfaces[1] is an interface with index 1,
             # that is the loopback interface.
             assert attr in ipdb.interfaces[1]
+
+
+@pytest.mark.skipif(
+    HAS_NDB is False, reason="pyroute2.ndb.compat not yet available, skipping"
+)
+def test_interface_dict_fields_new():
+    with NDB() as ndb:
+        # ndb provides dict-like objects for all the RTNL entities
+        # upon requests, like:
+        #
+        #   ndb.interfaces["lo"]
+        #   ndb.interfaces[{"target": "netns01", "ifname": "lo"}]
+        #   ndb.addresses["127.0.0.1/8"]
+        #
+        # but for our case is important that NDB provides listings of
+        # RTNL entities as sets of named tuples:
+        #
+        #   for record in ndb.interfaces:
+        #       print(record.index, record.ifname)
+        #
+        # pyroute2.ndb.compat.ipdb_interfaces_view() translates
+        # this view into a dict tree that resembles IPDB layout.
+        #
+        # beacon might use this translation to read the NDB info and at
+        # the same time not to saturate memory with multiple objects.
+        view = ipdb_interfaces_view(ndb)
+        for attr in network_settings.ATTRS:
+            assert attr in view["lo"]

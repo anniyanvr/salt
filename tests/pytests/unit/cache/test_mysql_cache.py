@@ -2,13 +2,11 @@
 unit tests for the mysql_cache cache
 """
 
-
 import logging
 
 import pytest
+
 import salt.cache.mysql_cache as mysql_cache
-import salt.payload
-import salt.utils.files
 from salt.exceptions import SaltCacheError
 from tests.support.mock import MagicMock, call, patch
 
@@ -17,20 +15,13 @@ log = logging.getLogger(__name__)
 pytestmark = [
     pytest.mark.skipif(
         mysql_cache.MySQLdb is None, reason="No python mysql client installed."
-    ),
+    )
 ]
 
 
 @pytest.fixture
 def configure_loader_modules():
     return {mysql_cache: {}}
-
-
-@pytest.fixture
-def master_config():
-    opts = salt.config.DEFAULT_MASTER_OPTS.copy()
-    opts["__role"] = "master"
-    return opts
 
 
 def test_run_query():
@@ -44,7 +35,7 @@ def test_run_query():
         mock_connect.assert_has_calls((expected_calls,), True)
 
 
-def test_store(master_config):
+def test_store():
     """
     Tests that the store function writes the data to the serializer for storage.
     """
@@ -64,8 +55,8 @@ def test_store(master_config):
                 expected_calls = [
                     call(
                         mock_connect_client,
-                        b"REPLACE INTO salt (bank, etcd_key, data) values(%s,%s,%s)",
-                        ("minions/minion", "key1", b"\xa4data"),
+                        "REPLACE INTO salt (bank, etcd_key, data) values(%s,%s,%s)",
+                        args=("minions/minion", "key1", b"\xa4data"),
                     )
                 ]
 
@@ -81,8 +72,8 @@ def test_store(master_config):
                 expected_calls = [
                     call(
                         mock_connect_client,
-                        b"REPLACE INTO salt (bank, etcd_key, data) values(%s,%s,%s)",
-                        ("minions/minion", "key2", b"\xa4data"),
+                        "REPLACE INTO salt (bank, etcd_key, data) values(%s,%s,%s)",
+                        args=("minions/minion", "key2", b"\xa4data"),
                     )
                 ]
 
@@ -100,7 +91,7 @@ def test_store(master_config):
                 assert expected in str(exc_info.value)
 
 
-def test_fetch(master_config):
+def test_fetch():
     """
     Tests that the fetch function reads the data from the serializer for storage.
     """
@@ -135,7 +126,11 @@ def test_flush():
             with patch.object(mysql_cache, "run_query") as mock_run_query:
 
                 expected_calls = [
-                    call(mock_connect_client, "DELETE FROM salt WHERE bank='bank'"),
+                    call(
+                        mock_connect_client,
+                        "DELETE FROM salt WHERE bank=%s",
+                        args=("bank",),
+                    ),
                 ]
                 mock_run_query.return_value = (MagicMock(), "")
                 mysql_cache.flush(bank="bank")
@@ -144,14 +139,15 @@ def test_flush():
                 expected_calls = [
                     call(
                         mock_connect_client,
-                        "DELETE FROM salt WHERE bank='bank' AND etcd_key='key'",
+                        "DELETE FROM salt WHERE bank=%s AND etcd_key=%s",
+                        args=("bank", "key"),
                     )
                 ]
                 mysql_cache.flush(bank="bank", key="key")
                 mock_run_query.assert_has_calls(expected_calls, True)
 
 
-def test_init_client(master_config):
+def test_init_client():
     """
     Tests that the _init_client places the correct information in __context__
     """
@@ -173,6 +169,7 @@ def test_init_client(master_config):
             assert (
                 mysql_cache.__context__["mysql_kwargs"]["max_allowed_packet"] == 100000
             )
+            assert not mysql_cache.__context__["mysql_fresh_connection"]
 
     with patch.dict(
         mysql_cache.__opts__,
@@ -180,6 +177,7 @@ def test_init_client(master_config):
             "mysql.max_allowed_packet": 100000,
             "mysql.db": "salt_mysql_db",
             "mysql.host": "mysql-host",
+            "mysql.fresh_connection": True,
         },
     ):
         with patch.object(mysql_cache, "_create_table") as mock_create_table:
@@ -196,9 +194,107 @@ def test_init_client(master_config):
             assert (
                 mysql_cache.__context__["mysql_kwargs"]["max_allowed_packet"] == 100000
             )
+            assert mysql_cache.__context__["mysql_fresh_connection"]
 
 
-def test_create_table(master_config):
+def test_ls_direct_keys():
+    """
+    Tests that ls() returns direct keys stored under exactly the given bank.
+
+    After store(bank='fnord/kevin/stuart', key='roscivs', data=...) the
+    contract requires cache.list('fnord/kevin/stuart') == ['roscivs'].
+    Query 1 (SELECT etcd_key WHERE bank=<bank>) must return the key.
+    """
+    mock_connect_client = MagicMock()
+    # Q1 (exact match) returns the key; Q2 (sub-banks LIKE) returns nothing.
+    q1_cursor = MagicMock()
+    q1_cursor.fetchall.return_value = [("roscivs",)]
+    q2_cursor = MagicMock()
+    q2_cursor.fetchall.return_value = []
+
+    with patch.object(mysql_cache, "_init_client"):
+        with patch.dict(
+            mysql_cache.__context__,
+            {
+                "mysql_table_name": "salt",
+                "mysql_client": mock_connect_client,
+            },
+        ):
+            with patch.object(mysql_cache, "run_query") as mock_run_query:
+                mock_run_query.side_effect = [
+                    (q1_cursor, 1),
+                    (q2_cursor, 0),
+                ]
+                result = mysql_cache.ls(bank="fnord/kevin/stuart")
+
+    assert sorted(result) == ["roscivs"]
+
+
+def test_ls_subbanks_for_manage_present():
+    """
+    Tests that ls() returns sub-bank names when data is stored under nested
+    banks — the manage.present use case.
+
+    Minion data is stored as store(bank='minions/<id>', key='data', ...).
+    cache.list('minions') must return the minion IDs.  Query 2
+    (SUBSTRING_INDEX(SUBSTR(bank, N), '/', 1) WHERE bank LIKE 'minions/%')
+    must return the IDs.
+    """
+    mock_connect_client = MagicMock()
+    # Q1 (exact match on 'minions') returns nothing; Q2 (sub-banks) returns ids.
+    q1_cursor = MagicMock()
+    q1_cursor.fetchall.return_value = []
+    q2_cursor = MagicMock()
+    q2_cursor.fetchall.return_value = [("minion1",), ("minion2",)]
+
+    with patch.object(mysql_cache, "_init_client"):
+        with patch.dict(
+            mysql_cache.__context__,
+            {
+                "mysql_table_name": "salt",
+                "mysql_client": mock_connect_client,
+            },
+        ):
+            with patch.object(mysql_cache, "run_query") as mock_run_query:
+                mock_run_query.side_effect = [
+                    (q1_cursor, 0),
+                    (q2_cursor, 2),
+                ]
+                result = mysql_cache.ls(bank="minions")
+
+    assert sorted(result) == ["minion1", "minion2"]
+
+
+def test_ls_combined_direct_and_subbanks():
+    """
+    Tests that ls() returns both direct keys AND sub-bank names when both are
+    present, deduplicating via a set so no entry appears twice.
+    """
+    mock_connect_client = MagicMock()
+    q1_cursor = MagicMock()
+    q1_cursor.fetchall.return_value = [("key1",), ("key2",)]
+    q2_cursor = MagicMock()
+    q2_cursor.fetchall.return_value = [("child",)]
+
+    with patch.object(mysql_cache, "_init_client"):
+        with patch.dict(
+            mysql_cache.__context__,
+            {
+                "mysql_table_name": "salt",
+                "mysql_client": mock_connect_client,
+            },
+        ):
+            with patch.object(mysql_cache, "run_query") as mock_run_query:
+                mock_run_query.side_effect = [
+                    (q1_cursor, 2),
+                    (q2_cursor, 1),
+                ]
+                result = mysql_cache.ls(bank="somebank")
+
+    assert sorted(result) == ["child", "key1", "key2"]
+
+
+def test_create_table():
     """
     Tests that the _create_table
     """
@@ -219,6 +315,9 @@ def test_create_table(master_config):
       bank CHAR(255),
       etcd_key CHAR(255),
       data MEDIUMBLOB,
+      last_update TIMESTAMP NOT NULL
+                  DEFAULT CURRENT_TIMESTAMP
+                  ON UPDATE CURRENT_TIMESTAMP,
       PRIMARY KEY(bank, etcd_key)
     );"""
             expected_calls = [call(mock_connect_client, sql_call)]

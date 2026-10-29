@@ -3,6 +3,7 @@ Watch for pkgs that have upgrades, then fire an event.
 
 .. versionadded:: 2016.3.0
 """
+
 import logging
 
 __virtualname__ = "pkg"
@@ -14,7 +15,12 @@ def __virtual__():
     """
     Only load if strace is installed
     """
-    return __virtualname__ if "pkg.upgrade_available" in __salt__ else False
+    if "pkg.upgrade_available" in __salt__:
+        return __virtualname__
+    else:
+        err_msg = "pkg.upgrade_available is missing."
+        log.error("Unable to load %s beacon: %s", __virtualname__, err_msg)
+        return False, err_msg
 
 
 def validate(config):

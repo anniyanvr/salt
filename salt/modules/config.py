@@ -15,6 +15,7 @@ import salt.utils.dictupdate
 import salt.utils.files
 import salt.utils.platform
 import salt.utils.sdb as sdb
+from salt.loader.context import LoaderContext
 
 try:
     # Gated for salt-ssh (salt.utils.cloud imports msgpack)
@@ -35,6 +36,8 @@ else:
 log = logging.getLogger(__name__)
 
 __proxyenabled__ = ["*"]
+__salt_loader__ = LoaderContext()
+__opts__ = __salt_loader__.named_context("__opts__")
 
 # Set up the default values for all systems
 DEFAULTS = {
@@ -519,10 +522,10 @@ def dot_vals(value):
     """
     ret = {}
     for key, val in __pillar__.get("master", {}).items():
-        if key.startswith("{}.".format(value)):
+        if key.startswith(f"{value}."):
             ret[key] = val
     for key, val in __opts__.items():
-        if key.startswith("{}.".format(value)):
+        if key.startswith(f"{value}."):
             ret[key] = val
     return ret
 

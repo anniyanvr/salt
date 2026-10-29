@@ -3,17 +3,26 @@ Tests for existence of manpages
 """
 
 import os
+import pathlib
 import pprint
 
 import pytest
+
 import salt.utils.platform
 from salt.modules.virtualenv_mod import KNOWN_BINARY_NAMES
+from tests.conftest import CODE_DIR
+
+MISSING_SETUP_PY_FILE = not CODE_DIR.joinpath("setup.py").exists()
 
 pytestmark = [
-    pytest.mark.slow_test,
+    pytest.mark.core_test,
     pytest.mark.skip_on_windows,
     pytest.mark.skip_on_aix,
+    pytest.mark.skip_initial_onedir_failure,
     pytest.mark.skip_if_binaries_missing(*KNOWN_BINARY_NAMES, check_all=False),
+    pytest.mark.skipif(
+        MISSING_SETUP_PY_FILE, reason="This test only work if setup.py is available"
+    ),
 ]
 
 
@@ -21,6 +30,9 @@ def test_man_pages(virtualenv, src_dir):
     """
     Make sure that man pages are installed
     """
+    if not (pathlib.Path(src_dir) / "doc" / "man").is_dir():
+        pytest.skip("Man pages are not generated in the source tree")
+
     # Map filenames to search strings which should be in the manpage
     manpages = {
         "salt-cp.1": ["salt-cp Documentation", "copies files from the master"],
@@ -33,7 +45,6 @@ def test_man_pages(virtualenv, src_dir):
             "salt-api Command",
             "Start interfaces used to remotely connect",
         ],
-        "salt-unity.1": ["salt-unity Command", "unified invocation wrapper"],
         "salt-syndic.1": ["salt-syndic Documentation", "Salt syndic daemon"],
         "salt-ssh.1": ["salt-ssh Documentation", "executed using only SSH"],
         "salt-run.1": ["salt-run Documentation", "frontend command for executing"],
@@ -58,7 +69,7 @@ def test_man_pages(virtualenv, src_dir):
             venv.venv_python,
             "setup.py",
             "install",
-            "--root={}".format(rootdir),
+            f"--root={rootdir}",
             cwd=src_dir,
         )
 

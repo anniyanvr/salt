@@ -2,10 +2,9 @@ import logging
 import os
 
 import pytest
+
 import salt.serializers.json as jsonserializer
 import salt.serializers.msgpack as msgpackserializer
-import salt.serializers.plist as plistserializer
-import salt.serializers.python as pythonserializer
 import salt.serializers.yaml as yamlserializer
 import salt.states.file as filestate
 import salt.utils.files
@@ -27,9 +26,7 @@ def configure_loader_modules():
             "__serializers__": {
                 "yaml.serialize": yamlserializer.serialize,
                 "yaml.seserialize": yamlserializer.serialize,
-                "python.serialize": pythonserializer.serialize,
                 "json.serialize": jsonserializer.serialize,
-                "plist.serialize": plistserializer.serialize,
                 "msgpack.serialize": msgpackserializer.serialize,
             },
             "__opts__": {"test": False, "cachedir": ""},
@@ -58,33 +55,43 @@ def test_comment():
         mock_t = MagicMock(return_value=True)
         mock_f = MagicMock(return_value=False)
         with patch.object(os.path, "isabs", mock_f):
-            comt = "Specified file {} is not an absolute path".format(name)
+            comt = f"Specified file {name} is not an absolute path"
             ret.update({"comment": comt, "name": name})
             assert filestate.comment(name, regex) == ret
 
         with patch.object(os.path, "isabs", mock_t):
             with patch.dict(
                 filestate.__salt__,
-                {"file.search": MagicMock(side_effect=[False, True, False, False])},
+                {
+                    "file.search": MagicMock(
+                        side_effect=[False, True, False, False, False, False]
+                    )
+                },
             ):
                 comt = "Pattern already commented"
                 ret.update({"comment": comt, "result": True})
                 assert filestate.comment(name, regex) == ret
 
-                comt = "{}: Pattern not found".format(regex)
+                comt = "Pattern not found and ignore_missing set to True"
+                ret.update({"comment": comt, "result": True})
+                assert filestate.comment(name, regex, ignore_missing=True) == ret
+
+                comt = f"{regex}: Pattern not found"
                 ret.update({"comment": comt, "result": False})
                 assert filestate.comment(name, regex) == ret
 
             with patch.dict(
                 filestate.__salt__,
                 {
-                    "file.search": MagicMock(side_effect=[True, True, True]),
+                    "file.search": MagicMock(
+                        side_effect=[True, True, True, False, True]
+                    ),
                     "file.comment": mock_t,
                     "file.comment_line": mock_t,
                 },
             ):
                 with patch.dict(filestate.__opts__, {"test": True}):
-                    comt = "File {} is set to be updated".format(name)
+                    comt = f"File {name} is set to be updated"
                     ret.update(
                         {"comment": comt, "result": None, "changes": {name: "updated"}}
                     )
@@ -97,6 +104,11 @@ def test_comment():
                         comt = "Commented lines successfully"
                         ret.update({"comment": comt, "result": True, "changes": {}})
                         assert filestate.comment(name, regex) == ret
+
+                with patch.dict(filestate.__opts__, {"test": True}):
+                    comt = "Pattern already commented"
+                    ret.update({"comment": comt, "result": True, "changes": {}})
+                    assert filestate.comment(name, regex) == ret
 
 
 # 'uncomment' function tests: 1
@@ -118,7 +130,7 @@ def test_uncomment():
         mock_f = MagicMock(return_value=False)
         mock = MagicMock(side_effect=[False, True, False, False, True, True, True])
         with patch.object(os.path, "isabs", mock_f):
-            comt = "Specified file {} is not an absolute path".format(name)
+            comt = f"Specified file {name} is not an absolute path"
             ret.update({"comment": comt, "name": name})
             assert filestate.uncomment(name, regex) == ret
 
@@ -135,12 +147,12 @@ def test_uncomment():
                 ret.update({"comment": comt, "result": True})
                 assert filestate.uncomment(name, regex) == ret
 
-                comt = "{}: Pattern not found".format(regex)
+                comt = f"{regex}: Pattern not found"
                 ret.update({"comment": comt, "result": False})
                 assert filestate.uncomment(name, regex) == ret
 
                 with patch.dict(filestate.__opts__, {"test": True}):
-                    comt = "File {} is set to be updated".format(name)
+                    comt = f"File {name} is set to be updated"
                     ret.update(
                         {"comment": comt, "result": None, "changes": {name: "updated"}}
                     )

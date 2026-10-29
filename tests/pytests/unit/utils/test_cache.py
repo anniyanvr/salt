@@ -5,15 +5,18 @@
     Test the salt cache objects
 """
 
+import logging
+import pathlib
 import time
 
 import pytest
-import salt.config
+
 import salt.loader
 import salt.payload
 import salt.utils.cache as cache
 import salt.utils.data
 import salt.utils.files
+from tests.support.mock import patch
 
 
 def test_sanity():
@@ -44,25 +47,38 @@ def test_ttl():
         cd["foo"]  # pylint: disable=pointless-statement
 
 
-@pytest.fixture
-def cache_dir(tmp_path):
-    cachedir = tmp_path / "cachedir"
-    cachedir.mkdir()
-    return cachedir
+def test_cache_regex_sweep_with_equal_usage_counts():
+    """
+    CacheRegex must be able to sweep and remove the outdated or least frequently
+    """
+    regex_cache = cache.CacheRegex(size=2, keep_fraction=0.5)
+
+    # Populate the cache and make two patterns share the same frequency
+    regex_cache.get("pattern1")
+    regex_cache.get("pattern2")
+    regex_cache.get("pattern1")
+    regex_cache.get("pattern2")
+
+    # Add a third pattern without triggering a sweep yet
+    regex_cache.get("pattern3")
+
+    # Adding a fourth pattern triggers a sweep internally
+    compiled = regex_cache.get("pattern4")
+
+    assert compiled is not None
+    assert "pattern4" in regex_cache.cache
 
 
 @pytest.fixture
-def minion_config(cache_dir):
-    opts = salt.config.DEFAULT_MINION_OPTS.copy()
-    opts["cachedir"] = str(cache_dir)
-    return opts
+def cache_dir(minion_opts):
+    return pathlib.Path(minion_opts["cachedir"])
 
 
-def test_smoke_context(minion_config):
+def test_smoke_context(minion_opts):
     """
     Smoke test the context cache
     """
-    context_cache = cache.ContextCache(minion_config, "cache_test")
+    context_cache = cache.ContextCache(minion_opts, "cache_test")
 
     data = {"a": "b"}
     context_cache.cache_context(data.copy())
@@ -70,6 +86,88 @@ def test_smoke_context(minion_config):
     ret = context_cache.get_cache_context()
 
     assert ret == data
+
+
+def test_cache_context_writes_with_owner_only_mode(minion_opts):
+    """
+    ``ContextCache.cache_context`` must produce a cache file with mode
+    ``0o600`` (owner-read+write only). The file holds pillar context
+    which can contain credentials (passwords, vault tokens, API keys);
+    on the previous implementation it inherited the process umask and
+    became world-readable on most Linux distributions.
+    """
+    import os
+    import stat
+
+    context_cache = cache.ContextCache(minion_opts, "cache_test_perms")
+    context_cache.cache_context({"secret": "value"})
+
+    mode = stat.S_IMODE(os.stat(context_cache.cache_path).st_mode)
+    assert mode == stat.S_IRUSR | stat.S_IWUSR, (
+        f"ContextCache file mode is {oct(mode)}, expected 0o600 "
+        f"(owner-read+write only). World-readable pillar cache leaks "
+        f"credentials to any local user."
+    )
+
+
+def test_cache_context_creates_parent_directory_with_owner_only_mode(
+    minion_opts, tmp_path
+):
+    """
+    The on-disk ``context/`` directory holding cached pillar data must
+    be created with mode ``0o700`` (owner-only). The previous
+    implementation created the directory with the default ``os.mkdir``
+    mode of ``0o755`` modulo the process umask -- which on most Linux
+    installs left it world-readable, so any local user could ``ls`` the
+    directory and learn which modules and external-pillar backends were
+    cached (filenames look like ``salt.loaded.ext.<module>.<name>.p``).
+    """
+    import os
+    import stat
+
+    # Use a fresh cachedir so context/ does not pre-exist from another
+    # test, otherwise the mode of the existing directory is whatever
+    # earlier code left behind and the test can't verify our behaviour.
+    fresh_opts = {**minion_opts, "cachedir": str(tmp_path / "fresh_cachedir")}
+    os.makedirs(fresh_opts["cachedir"])
+    cc = cache.ContextCache(fresh_opts, "first_write")
+    cc.cache_context({"v": 1})
+
+    parent = os.path.dirname(cc.cache_path)
+    mode = stat.S_IMODE(os.stat(parent).st_mode)
+    assert mode == stat.S_IRWXU, (
+        f"context/ dir mode is {oct(mode)}, expected 0o700 "
+        f"(owner-only). World-readable parent leaks cache filenames "
+        f"and metadata to local users."
+    )
+
+
+def test_cache_context_overwrites_atomically_via_replace(minion_opts):
+    """
+    ``ContextCache.cache_context`` must overwrite the cache file
+    atomically: a concurrent reader during a re-cache must see either
+    the previous content or the new one in full, never a partially
+    written file. The ``tempfile.mkstemp`` + ``os.replace`` path makes
+    this guarantee at the POSIX layer; the previous in-place
+    truncate-and-write path did not. Compare inode numbers across two
+    successive writes -- atomic replace gives a fresh inode each time
+    (the rename swaps the directory entry to a new file), in-place
+    truncate keeps the inode constant.
+    """
+    import os
+
+    cc = cache.ContextCache(minion_opts, "cache_test_atomic")
+    cc.cache_context({"v": 1})
+    inode_first = os.stat(cc.cache_path).st_ino
+    cc.cache_context({"v": 2})
+    inode_second = os.stat(cc.cache_path).st_ino
+
+    assert inode_first != inode_second, (
+        "ContextCache write reused the same inode, indicating in-place "
+        "truncate-and-write rather than atomic mkstemp+replace; readers "
+        "concurrent with the write can observe a partial file."
+    )
+    assert cc.get_cache_context() == {"v": 2}
 
 
 @pytest.fixture
@@ -104,7 +202,7 @@ def cache_mods_path(tmp_path, cache_mod_name):
         yield _cache_mods_path
 
 
-def test_context_wrapper(minion_config, cache_mods_path):
+def test_context_wrapper(minion_opts, cache_mods_path):
     """
     Test to ensure that a module which decorates itself
     with a context cache can store and retrieve its contextual
@@ -115,7 +213,7 @@ def test_context_wrapper(minion_config, cache_mods_path):
         [str(cache_mods_path)],
         tag="rawmodule",
         virtual_enable=False,
-        opts=minion_config,
+        opts=minion_opts,
     )
 
     cache_test_func = loader["cache_mod.test_context_module"]
@@ -124,7 +222,7 @@ def test_context_wrapper(minion_config, cache_mods_path):
     assert cache_test_func()["called"] == 1
 
 
-def test_set_cache(minion_config, cache_mods_path, cache_mod_name, cache_dir):
+def test_set_cache(minion_opts, cache_mods_path, cache_mod_name, cache_dir):
     """
     Tests to ensure the cache is written correctly
     """
@@ -134,8 +232,8 @@ def test_set_cache(minion_config, cache_mods_path, cache_mod_name, cache_dir):
         [str(cache_mods_path)],
         tag="rawmodule",
         virtual_enable=False,
-        opts=minion_config,
-        pack={"__context__": context, "__opts__": minion_config},
+        opts=minion_opts,
+        pack={"__context__": context, "__opts__": minion_opts},
     )
 
     cache_test_func = loader["cache_mod.test_context_module"]
@@ -145,7 +243,7 @@ def test_set_cache(minion_config, cache_mods_path, cache_mod_name, cache_dir):
     assert cache_test_func()["called"] == 1
     assert cache_test_func()["called"] == 2
 
-    cache_file_name = "salt.loaded.ext.rawmodule.{}.p".format(cache_mod_name)
+    cache_file_name = f"salt.loaded.ext.rawmodule.{cache_mod_name}.p"
 
     cached_file = cache_dir / "context" / cache_file_name
     assert cached_file.exists()
@@ -157,14 +255,12 @@ def test_set_cache(minion_config, cache_mods_path, cache_mod_name, cache_dir):
     assert target_cache_data == dict(context, called=1)
 
     # Test cache de-serialize
-    cc = cache.ContextCache(
-        minion_config, "salt.loaded.ext.rawmodule.{}".format(cache_mod_name)
-    )
+    cc = cache.ContextCache(minion_opts, f"salt.loaded.ext.rawmodule.{cache_mod_name}")
     retrieved_cache = cc.get_cache_context()
     assert retrieved_cache == dict(context, called=1)
 
 
-def test_refill_cache(minion_config, cache_mods_path):
+def test_refill_cache(minion_opts, cache_mods_path):
     """
     Tests to ensure that the context cache can rehydrate a wrapped function
     """
@@ -173,8 +269,8 @@ def test_refill_cache(minion_config, cache_mods_path):
         [str(cache_mods_path)],
         tag="rawmodule",
         virtual_enable=False,
-        opts=minion_config,
-        pack={"__context__": context, "__opts__": minion_config},
+        opts=minion_opts,
+        pack={"__context__": context, "__opts__": minion_opts},
     )
 
     cache_test_func = loader["cache_mod.test_compare_context"]
@@ -191,11 +287,11 @@ def test_refill_cache(minion_config, cache_mods_path):
     assert ret == context_copy
 
 
-def test_everything(tmp_path):
+def test_everything(cache_dir):
     """
     Make sure you can instantiate, add, update, remove, expire
     """
-    path = str(tmp_path / "cachedir")
+    path = str(cache_dir / "minion")
 
     # test instantiation
     cd = cache.CacheDisk(0.3, path)
@@ -219,3 +315,64 @@ def test_everything(tmp_path):
     time.sleep(0.5)
     assert "foo" not in cd
     assert "foo" not in cd2
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"PK\x03\x04\n\x00\x00\x00\x00\x00\xb6B\x05S\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x06\x00\x1c\x00test2/",
+        b"\xc3\x83\xc2\xa6\xc3\x83\xc2\xb8\xc3\x83\xc2\xa5",
+    ],
+)
+def test_unicode_error(cache_dir, data, caplog):
+    """
+    Test when the data in the cache raises a UnicodeDecodeError
+    we do not raise an error.
+    """
+    path = cache_dir / "minion"
+    path.touch()
+    cache_data = {
+        "CacheDisk_data": {
+            b"poc-minion": {
+                None: {
+                    b"secrets": {
+                        b"itsasecret": data,
+                        b"CacheDisk_cachetime": {b"poc-minion": 1649339137.1236317},
+                    }
+                }
+            }
+        }
+    }
+    with patch.object(
+        salt.utils.msgpack, "load", return_value=cache_data
+    ), caplog.at_level(logging.DEBUG):
+        cd = cache.CacheDisk(0.3, str(path))
+        # this test used to rely on msgpack throwing errors if attempt to read an empty file
+        # code now checks if file empty and returns, so we should never attempt msgpack load
+        assert cd._dict == {}
+        assert not (
+            f"Error reading cache file at '{path}': Unpack failed: incomplete input"
+            in caplog.messages
+        )
+
+
+def test_cache_corruption(cache_dir):
+    """
+    Tests if the CacheDisk can survive a corrupted cache file.
+    """
+    # Write valid cache file
+    cache_file = cache_dir / "minion"
+    cd = cache.CacheDisk(0.3, str(cache_file))
+    cd["test-key"] = "test-value"
+    del cd
+
+    # Add random string to the data to make the msgpack structure un-decodable
+    with cache_file.open("a") as f:
+        f.write("I am data that should corrupt the msgpack file")
+
+    # Reopen cache, try to fetch key
+    cd = cache.CacheDisk(0.3, str(cache_file))
+    # If the cache is unreadable, we want it to act like an empty cache (as
+    # if the file did not exist in the first place), and should raise a KeyError
+    with pytest.raises(KeyError):
+        assert cd["test-key"]

@@ -3,15 +3,29 @@ from subprocess import PIPE
 from textwrap import dedent
 
 import pytest
-import salt.config
+
 import salt.renderers.gpg as gpg
 from salt.exceptions import SaltRenderError
 from tests.support.mock import MagicMock, Mock, call, patch
 
 
+def _find_unused_pid():
+    """Return a PID that is (almost certainly) not currently running."""
+    for candidate in (4194303, 4194302, 4194301, 999999, 888888):
+        try:
+            os.kill(candidate, 0)
+        except OSError:
+            return candidate
+    raise RuntimeError("Unable to locate an unused PID for testing")
+
+
 @pytest.fixture
-def configure_loader_modules():
-    return {gpg: {}}
+def configure_loader_modules(minion_opts):
+    """
+    GPG renderer configuration
+    """
+    minion_opts["gpg_decrypt_must_succeed"] = True
+    return {gpg: {"__opts__": minion_opts}}
 
 
 def test__get_gpg_exec():
@@ -53,8 +67,20 @@ def test__decrypt_ciphertext():
             assert gpg._decrypt_ciphertexts(crypted) == secret
             assert gpg._decrypt_ciphertexts(multicrypted) == multisecret
         with patch("salt.renderers.gpg.Popen", MagicMock(return_value=GPGNotDecrypt())):
-            assert gpg._decrypt_ciphertexts(crypted) == crypted
-            assert gpg._decrypt_ciphertexts(multicrypted) == multicrypted
+            with pytest.raises(SaltRenderError) as decrypt_error:
+                gpg._decrypt_ciphertexts(crypted)
+            # Assertions must be made after closure of context manager
+            assert decrypt_error.value.args[0].startswith("Could not decrypt cipher ")
+            assert crypted in decrypt_error.value.args[0]
+            assert "decrypt error" in decrypt_error.value.args[0]
+            with pytest.raises(SaltRenderError) as multidecrypt_error:
+                gpg._decrypt_ciphertexts(multicrypted)
+            assert multidecrypt_error.value.args[0].startswith(
+                "Could not decrypt cipher "
+            )
+            # Function will raise on a single ciphertext even if multiple are passed
+            assert crypted in multidecrypt_error.value.args[0]
+            assert "decrypt error" in multidecrypt_error.value.args[0]
 
 
 def test__decrypt_object():
@@ -240,7 +266,76 @@ def test_render_without_cache():
                 popen_mock.assert_has_calls([gpg_call] * 3)
 
 
-def test_render_with_cache():
+def test_cleanup_stale_lockfiles_removes_dead_pid_locks_68869(tmp_path):
+    """
+    Regression test for #68869.
+
+    GnuPG writes ``dotlock`` files (``.#lk<addr>.<host>.<pid>``) when
+    acquiring a lock on a keyring file. If the gpg process is killed before
+    it can rename the dotlock to its final ``<file>.lock`` name (for example
+    when its parent salt-master worker is terminated mid-decrypt), the
+    dotlock is orphaned. Over time these accumulate in ``gpg_keydir``.
+
+    The cleanup helper must remove dotlock files whose owning PID is no
+    longer running, and must leave any other files (including a dotlock
+    owned by a live PID) alone.
+    """
+    dead_pid = _find_unused_pid()
+    live_pid = os.getpid()
+
+    # Layout mirrors the report in the issue: ``host pid`` payload, padded
+    # to ``host.pid`` style filenames.
+    stale = tmp_path / f".#lk0x00005fead0da9180.salt.{dead_pid}"
+    stale.write_text(f"salt {dead_pid}")
+    live = tmp_path / f".#lk0x00005fead0da9181.salt.{live_pid}"
+    live.write_text(f"salt {live_pid}")
+    unrelated = tmp_path / "pubring.kbx"
+    unrelated.write_text("not a lock")
+
+    gpg._cleanup_stale_lockfiles(str(tmp_path))
+
+    assert not stale.exists()
+    assert live.exists()
+    assert unrelated.exists()
+
+
+def test_cleanup_stale_lockfiles_handles_missing_keydir_68869(tmp_path):
+    """
+    The helper must not raise if the keydir does not exist or is not a
+    directory; the renderer is called before any keys are configured in
+    some setups.
+    """
+    missing = tmp_path / "does-not-exist"
+    # Should be a no-op rather than raising.
+    gpg._cleanup_stale_lockfiles(str(missing))
+    gpg._cleanup_stale_lockfiles(None)
+
+
+def test__decrypt_ciphertext_cleans_stale_lockfiles_68869():
+    """
+    Regression test for #68869: ``_decrypt_ciphertext`` must run the
+    stale-lockfile cleanup against the keydir before invoking ``gpg``.
+    """
+    key_dir = "/etc/salt/gpgkeys"
+    secret = "Use more salt."
+    crypted = "-----BEGIN PGP MESSAGE-----!@#$%^&*()_+-----END PGP MESSAGE-----"
+
+    class GPGDecrypt:
+        def communicate(self, *args, **kwargs):
+            return [secret, None]
+
+    with patch(
+        "salt.renderers.gpg._get_key_dir", MagicMock(return_value=key_dir)
+    ), patch("salt.utils.path.which", MagicMock()), patch(
+        "salt.renderers.gpg.Popen", MagicMock(return_value=GPGDecrypt())
+    ), patch(
+        "salt.renderers.gpg._cleanup_stale_lockfiles"
+    ) as cleanup_mock:
+        gpg._decrypt_ciphertexts(crypted)
+        cleanup_mock.assert_called_with(key_dir)
+
+
+def test_render_with_cache(minion_opts):
     key_dir = "/etc/salt/gpgkeys"
     secret = "Use more salt."
     expected = "\n".join([secret] * 3)
@@ -258,7 +353,6 @@ def test_render_with_cache():
     """
     )
 
-    minion_opts = salt.config.DEFAULT_MINION_OPTS.copy()
     minion_opts["gpg_cache"] = True
     with patch.dict(gpg.__opts__, minion_opts):
         with patch("salt.renderers.gpg.Popen") as popen_mock:

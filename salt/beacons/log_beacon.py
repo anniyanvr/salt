@@ -4,6 +4,7 @@ Beacon to fire events at specific log messages.
 .. versionadded:: 2017.7.0
 
 """
+
 import logging
 
 import salt.utils.beacons
@@ -33,7 +34,8 @@ log = logging.getLogger(__name__)
 def __virtual__():
     if not salt.utils.platform.is_windows() and HAS_REGEX:
         return __virtualname__
-    return False
+    err_msg = "Not available for Windows systems or when regex library is missing."
+    return False, err_msg
 
 
 def _get_loc():
@@ -114,7 +116,7 @@ def beacon(config):
         fp_.seek(loc)
 
         txt = fp_.read()
-        log.info("txt %s", txt)
+        log.trace("txt %s", txt)
 
         d = {}
         for tag in config.get("tags", {}):

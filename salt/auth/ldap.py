@@ -3,12 +3,14 @@ Provide authentication using simple LDAP binds
 
 :depends:   - ldap Python module
 """
+
 import itertools
 import logging
 
+from jinja2 import Environment
+
 import salt.utils.data
 import salt.utils.stringutils
-from jinja2 import Environment
 from salt.exceptions import CommandExecutionError, SaltInvocationError
 
 log = logging.getLogger(__name__)
@@ -16,8 +18,8 @@ log = logging.getLogger(__name__)
 try:
     # pylint: disable=no-name-in-module
     import ldap
-    import ldap.modlist
     import ldap.filter
+    import ldap.modlist
 
     HAS_LDAP = True
     # pylint: enable=no-name-in-module
@@ -52,15 +54,15 @@ def _config(key, mandatory=True, opts=None):
     """
     try:
         if opts:
-            value = opts["auth.ldap.{}".format(key)]
+            value = opts[f"auth.ldap.{key}"]
         else:
-            value = __opts__["auth.ldap.{}".format(key)]
+            value = __opts__[f"auth.ldap.{key}"]
     except KeyError:
         try:
-            value = __defopts__["auth.ldap.{}".format(key)]
+            value = __defopts__[f"auth.ldap.{key}"]
         except KeyError:
             if mandatory:
-                msg = "missing auth.ldap.{} in master config".format(key)
+                msg = f"missing auth.ldap.{key} in master config"
                 raise SaltInvocationError(msg)
             return False
     return value
@@ -118,13 +120,13 @@ class _LDAPConnection:
 
         schema = "ldaps" if tls else "ldap"
         if self.uri == "":
-            self.uri = "{}://{}:{}".format(schema, self.server, self.port)
+            self.uri = f"{schema}://{self.server}:{self.port}"
 
         try:
             if no_verify:
                 ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
 
-            self.ldap = ldap.initialize("{}".format(self.uri))
+            self.ldap = ldap.initialize(f"{self.uri}")
             self.ldap.protocol_version = 3  # ldap.VERSION3
             self.ldap.set_option(ldap.OPT_REFERRALS, 0)  # Needed for AD
 
@@ -473,7 +475,14 @@ def groups(username, **kwargs):
 
             log.debug("User %s is a member of groups: %s", username, group_list)
 
-            if not auth(username, kwargs["password"]):
+            # Only test user auth on first call for job.
+            # 'show_jid' only exists on first payload so we can use that for the conditional.
+            if "show_jid" in kwargs and not _bind(
+                username,
+                kwargs.get("password"),
+                anonymous=_config("auth_by_group_membership_only", mandatory=False)
+                and _config("anonymous", mandatory=False),
+            ):
                 log.error("LDAP username and password do not match")
                 return []
         else:

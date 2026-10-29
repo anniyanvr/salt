@@ -2,6 +2,7 @@
 The main entry point for salt-api
 """
 
+import asyncio
 import logging
 import signal
 
@@ -46,18 +47,12 @@ class NetapiClient:
         if not self.netapi:
             log.error("Did not find any netapi configurations, nothing to start")
 
-        kwargs = {}
-        if salt.utils.platform.is_windows():
-            kwargs["log_queue"] = salt.log.setup.get_multiprocessing_logging_queue()
-            kwargs[
-                "log_queue_level"
-            ] = salt.log.setup.get_multiprocessing_logging_level()
-
         for fun in self.netapi:
             if fun.endswith(".start"):
-                log.info("Starting %s netapi module", fun)
+                name = f"RunNetapi({self.netapi[fun].__module__})"
+                log.info("Starting %s", name)
                 self.process_manager.add_process(
-                    RunNetapi, args=(self.opts, fun), kwargs=kwargs, name="RunNetapi"
+                    RunNetapi, args=(self.opts, fun), name=name
                 )
 
         # Install the SIGINT/SIGTERM handlers if not done so far
@@ -69,7 +64,7 @@ class NetapiClient:
             # No custom signal handling was added, install our own
             signal.signal(signal.SIGTERM, self._handle_signals)
 
-        self.process_manager.run()
+        asyncio.run(self.process_manager.run())
 
     def _handle_signals(self, signum, sigframe):
         # escalate the signals to the process manager

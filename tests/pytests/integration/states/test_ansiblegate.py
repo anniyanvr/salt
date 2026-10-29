@@ -2,13 +2,17 @@
 Test AnsibleGate State Module
 """
 
+import logging
 import shutil
+import textwrap
 
 import pytest
+import yaml
+from pytestshellutils.exceptions import FactoryTimeout
+from saltfactories.utils.functional import StateResult
+
 import salt.utils.files
 import salt.utils.path
-import yaml
-from saltfactories.utils.functional import StateResult
 from tests.support.runtests import RUNTIME_VARS
 
 pytestmark = [
@@ -21,11 +25,15 @@ pytestmark = [
     ),
 ]
 
+log = logging.getLogger(__name__)
+
 
 @pytest.fixture(scope="module")
 def ansible_inventory_directory(tmp_path_factory, grains):
-    if grains["os_family"] != "RedHat":
+    if grains["os_family"] != "RedHat" or grains["os"] == "VMware Photon OS":
         pytest.skip("Currently, the test targets the RedHat OS familly only.")
+    if grains["os"] == "Rocky" and grains["osmajorrelease"] == 8:
+        pytest.skip("ansible-core doesn't support dnf on Rocky Linux 8")
     tmp_dir = tmp_path_factory.mktemp("ansible")
     try:
         yield tmp_dir
@@ -34,7 +42,7 @@ def ansible_inventory_directory(tmp_path_factory, grains):
 
 
 @pytest.fixture(scope="module", autouse=True)
-def ansible_inventory(ansible_inventory_directory, sshd_server):
+def ansible_inventory(ansible_inventory_directory, sshd_server, known_hosts_file):
     inventory = str(ansible_inventory_directory / "inventory")
     client_key = str(sshd_server.config_dir / "client_key")
     data = {
@@ -46,8 +54,7 @@ def ansible_inventory(ansible_inventory_directory, sshd_server):
                     "ansible_user": RUNTIME_VARS.RUNNING_TESTS_USER,
                     "ansible_ssh_private_key_file": client_key,
                     "ansible_ssh_extra_args": (
-                        "-o StrictHostKeyChecking=false "
-                        "-o UserKnownHostsFile=/dev/null "
+                        f"-o UserKnownHostsFile={known_hosts_file} "
                     ),
                 },
             },
@@ -59,23 +66,97 @@ def ansible_inventory(ansible_inventory_directory, sshd_server):
 
 
 @pytest.mark.requires_sshd_server
-def test_ansible_playbook(salt_call_cli, ansible_inventory):
-    ret = salt_call_cli.run(
-        "state.single",
-        "ansible.playbooks",
-        name="remove.yml",
-        git_repo="https://github.com/saltstack/salt-test-suite-ansible-playbooks.git",
-        ansible_kwargs={"inventory": ansible_inventory},
-    )
-    assert ret.exitcode == 0
-    assert StateResult(ret.json).result is True
+@pytest.mark.timeout_unless_on_windows(240)
+def test_ansible_playbook(salt_call_cli, ansible_inventory, tmp_path, grains):
 
-    ret = salt_call_cli.run(
-        "state.single",
-        "ansible.playbooks",
-        name="install.yml",
-        git_repo="https://github.com/saltstack/salt-test-suite-ansible-playbooks.git",
-        ansible_kwargs={"inventory": ansible_inventory},
+    # System python too old since upgrading to ansible 10.7.0
+    if grains["osfinger"] in (
+        "CentOS Linux-7",
+        "Amazon Linux-2",
+    ):
+        pytest.skip(reason="System python too old for test")
+
+    rundir = tmp_path / "rundir"
+    rundir.mkdir(exist_ok=True, parents=True)
+    remove_contents = textwrap.dedent(
+        """
+    ---
+    - hosts: all
+      tasks:
+      - name: remove postfix dnf
+        ansible.builtin.dnf:
+          name: postfix
+          state: absent
+        become: true
+        when: ansible_pkg_mgr == 'dnf'
+
+      - name: remove postfix yum
+        ansible.builtin.yum:
+          name: postfix
+          state: absent
+        become: true
+        when: ansible_pkg_mgr == 'yum'
+
+      - name: remove postfix apt
+        ansible.builtin.apt:
+          name: postfix
+          state: absent
+        become: true
+        when: ansible_pkg_mgr == 'apt'
+    """
     )
-    assert ret.exitcode == 0
-    assert StateResult(ret.json).result is True
+    remove_playbook = rundir / "remove.yml"
+    remove_playbook.write_text(remove_contents)
+    install_contents = textwrap.dedent(
+        """
+    ---
+    - hosts: all
+      tasks:
+      - name: install postfix dnf
+        ansible.builtin.dnf:
+          name: postfix
+          state: present
+        become: true
+        when: ansible_pkg_mgr == 'dnf'
+
+      - name: install postfix yum
+        ansible.builtin.yum:
+          name: postfix
+          state: present
+        become: true
+        when: ansible_pkg_mgr == 'yum'
+
+      - name: install postfix apt
+        ansible.builtin.apt:
+          name: postfix
+          state: present
+        become: true
+        when: ansible_pkg_mgr == 'apt'
+    """
+    )
+    install_playbook = rundir / "install.yml"
+    install_playbook.write_text(install_contents)
+
+    # These tests have been known to timeout, so allow them longer if needed.
+    timeouts = [60, 120, 180]
+    names = ["remove.yml", "install.yml"]
+
+    for name in names:
+        for timeout in timeouts:
+            try:
+                ret = salt_call_cli.run(
+                    "state.single",
+                    "ansible.playbooks",
+                    name=name,
+                    rundir=str(rundir),
+                    ansible_kwargs={"inventory": ansible_inventory},
+                    _timeout=timeout,  # The removal can take over 60 seconds
+                )
+            except FactoryTimeout:
+                log.debug("%s took longer than %s seconds", name, timeout)
+                if timeout == timeouts[-1]:
+                    pytest.fail(f"Failed to run {name}")
+            else:
+                assert ret.returncode == 0
+                assert StateResult(ret.data).result is True
+                break

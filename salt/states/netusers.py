@@ -54,31 +54,30 @@ def __virtual__():
 
 
 def _retrieve_users():
-
     """Retrieves configured users"""
 
     return __salt__["users.config"]()
 
 
 def _ordered_dict_to_dict(probes):
-
     """."""
 
     return salt.utils.json.loads(salt.utils.json.dumps(probes))
 
 
 def _expand_users(device_users, common_users):
-
     """Creates a longer list of accepted users on the device."""
 
-    expected_users = copy.deepcopy(common_users)
+    # ``common_users`` (the state's ``defaults`` argument) is optional, so it is
+    # ``None`` whenever the user does not declare any defaults. Treat that the
+    # same as an empty mapping rather than crashing on ``None.update()``.
+    expected_users = copy.deepcopy(common_users) if common_users else {}
     expected_users.update(device_users)
 
     return expected_users
 
 
 def _check_users(users):
-
     """Checks if the input dictionary of users is valid."""
 
     messg = ""
@@ -87,7 +86,7 @@ def _check_users(users):
     for user, user_details in users.items():
         if not user_details:
             valid = False
-            messg += "Please provide details for username {user}.\n".format(user=user)
+            messg += f"Please provide details for username {user}.\n"
             continue
         if not (
             isinstance(user_details.get("level"), int)
@@ -103,7 +102,6 @@ def _check_users(users):
 
 
 def _compute_diff(configured, expected):
-
     """Computes the differences between the actual config and the expected config"""
 
     diff = {"add": {}, "update": {}, "remove": {}}
@@ -135,21 +133,18 @@ def _compute_diff(configured, expected):
 
 
 def _set_users(users):
-
     """Calls users.set_users."""
 
     return __salt__["users.set_users"](users, commit=False)
 
 
 def _update_users(users):
-
     """Calls users.set_users."""
 
     return __salt__["users.set_users"](users, commit=False)
 
 
 def _delete_users(users):
-
     """Calls users.delete_users."""
 
     return __salt__["users.delete_users"](users, commit=False)
@@ -161,7 +156,6 @@ def _delete_users(users):
 
 
 def managed(name, users=None, defaults=None):
-
     """
     Manages the configuration of the users on the device, as specified in the state SLS file. Users not defined in that
     file will be removed whilst users not configured on the device, will be added.
@@ -328,6 +322,21 @@ def managed(name, users=None, defaults=None):
     defaults = _ordered_dict_to_dict(defaults)
 
     expected_users = _expand_users(users, defaults)
+
+    if not expected_users:
+        # Neither ``users`` nor ``defaults`` yielded anyone to manage. Because
+        # this is a declarative state, proceeding would remove *every* account
+        # configured on the device -- a likely lockout, e.g. when a pillar
+        # lookup renders to an empty mapping. Refuse rather than wipe. See
+        # #62170: previously an unset ``defaults`` crashed here, which happened
+        # to mask this case.
+        ret["comment"] = (
+            "No users were provided to manage. Refusing to proceed, as this"
+            " would remove every user configured on the device. Check the"
+            " state's 'users' and 'defaults' (and any pillar data behind them)."
+        )
+        return ret
+
     valid, message = _check_users(expected_users)
 
     if not valid:  # check and clean

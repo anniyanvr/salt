@@ -6,6 +6,7 @@ The ``salt-key`` command makes use of this outputter to format its output.
 """
 
 import salt.output
+import salt.transport
 import salt.utils.color
 import salt.utils.data
 
@@ -22,7 +23,7 @@ def output(data, **kwargs):  # pylint: disable=unused-argument
     ident = 0
     if __opts__.get("__multi_key"):
         ident = 4
-    if __opts__["transport"] in ("zeromq", "tcp"):
+    if __opts__["transport"] in salt.transport.TRANSPORTS:
         acc = "minions"
         pend = "minions_pre"
         den = "minions_denied"
@@ -80,19 +81,25 @@ def output(data, **kwargs):  # pylint: disable=unused-argument
             ),
         }
 
-    ret = ""
+    ret = []
 
     for status in sorted(data):
-        ret += "{}\n".format(trans[status])
+        ret.append(f"{trans[status]}")
         for key in sorted(data[status]):
             key = salt.utils.data.decode(key)
             skey = salt.output.strip_esc_sequence(key) if strip_colors else key
             if isinstance(data[status], list):
-                ret += "{}{}{}{}\n".format(
-                    " " * ident, cmap[status], skey, color["ENDC"]
+                ret.append(
+                    "{}{}{}{}".format(" " * ident, cmap[status], skey, color["ENDC"])
                 )
             if isinstance(data[status], dict):
-                ret += "{}{}{}:  {}{}\n".format(
-                    " " * ident, cmap[status], skey, data[status][key], color["ENDC"]
+                ret.append(
+                    "{}{}{}:  {}{}".format(
+                        " " * ident,
+                        cmap[status],
+                        skey,
+                        data[status][key],
+                        color["ENDC"],
+                    )
                 )
-    return ret
+    return "\n".join(ret)

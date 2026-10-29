@@ -44,7 +44,9 @@ log = logging.getLogger(__name__)
 def __virtual__():
     if HAS_PYINOTIFY:
         return __virtualname__
-    return False
+    err_msg = "pyinotify library is missing."
+    log.error("Unable to load inotify beacon: %s", err_msg)
+    return False, err_msg
 
 
 def _get_mask(mask):
@@ -66,7 +68,7 @@ def _get_notifier(config):
     Check the context for the notifier and construct it if not present
     """
     beacon_name = config.get("_beacon_name", "inotify")
-    notifier = "{}.notifier".format(beacon_name)
+    notifier = f"{beacon_name}.notifier"
     if notifier not in __context__:
         __context__["inotify.queue"] = collections.deque()
         wm = pyinotify.WatchManager()
@@ -351,7 +353,7 @@ def beacon(config):
 def close(config):
     config = salt.utils.beacons.list_to_dict(config)
     beacon_name = config.get("_beacon_name", "inotify")
-    notifier = "{}.notifier".format(beacon_name)
+    notifier = f"{beacon_name}.notifier"
     if notifier in __context__:
         __context__[notifier].stop()
         del __context__[notifier]

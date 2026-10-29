@@ -21,7 +21,7 @@ Dependencies
 - :mod:`NAPALM proxy minion <salt.proxy.napalm>`
 - :mod:`NTP operational and configuration management module <salt.modules.napalm_ntp>`
 
-.. _netaddr: https://pythonhosted.org/netaddr/
+.. _netaddr: https://netaddr.readthedocs.io/en/latest/
 .. _dnspython: http://www.dnspython.org/
 """
 
@@ -38,7 +38,8 @@ except ImportError:
     HAS_NETADDR = False
 
 try:
-    import dns.resolver
+    import dns.exception  # pylint: disable=no-name-in-module
+    import dns.resolver  # pylint: disable=no-name-in-module
 
     HAS_DNSRESOLVER = True
 except ImportError:
@@ -80,21 +81,18 @@ def _default_ret(name):
 
 
 def _retrieve_ntp_peers():
-
     """Retrieves configured NTP peers"""
 
     return __salt__["ntp.peers"]()
 
 
 def _retrieve_ntp_servers():
-
     """Retrieves configured NTP servers"""
 
     return __salt__["ntp.servers"]()
 
 
 def _check(peers):
-
     """Checks whether the input is a valid list of peers and transforms domain names into IP Addresses"""
 
     if not isinstance(peers, list):
@@ -118,19 +116,28 @@ def _check(peers):
             # if not a valid IP Address
             # will try to see if it is a nameserver and resolve it
             if not HAS_DNSRESOLVER:
-                continue  # without the dns resolver cannot populate the list of NTP entities based on their nameserver
-                # so we'll move on
+                # without the dns resolver we cannot resolve the name; keep the
+                # entry as specified and let the device validate it on load
+                ip_only_peers.append(peer)
+                continue
             dns_reply = []
             try:
                 # try to see if it is a valid NS
                 dns_reply = dns.resolver.query(peer)
-            except dns.resolver.NoAnswer:
-                # no a valid DNS entry either
+            except dns.exception.DNSException:
+                # not a resolvable name either (NoAnswer, NXDOMAIN, Timeout,
+                # NoNameservers, ...); treat the input as invalid rather than
+                # letting the DNS error abort the whole state run
                 return False
             for dns_ip in dns_reply:
                 ip_only_peers.append(str(dns_ip))
 
-    peers = ip_only_peers
+    # Rewrite the caller's list in place with the resolved addresses. ``_check``
+    # is documented to transform domain names into IP addresses, but the old
+    # ``peers = ip_only_peers`` only rebound the local name, so the resolved
+    # values were discarded and domain-name peers never converged (the device
+    # reports IPs, the desired list kept the names, so the diff never emptied).
+    peers[:] = ip_only_peers
 
     return True
 
@@ -141,28 +148,24 @@ def _clean(lst):
 
 
 def _set_ntp_peers(peers):
-
     """Calls ntp.set_peers."""
 
     return __salt__["ntp.set_peers"](*peers, commit=False)
 
 
 def _set_ntp_servers(servers):
-
     """Calls ntp.set_servers."""
 
     return __salt__["ntp.set_servers"](*servers, commit=False)
 
 
 def _delete_ntp_peers(peers):
-
     """Calls ntp.delete_peers."""
 
     return __salt__["ntp.delete_peers"](*peers, commit=False)
 
 
 def _delete_ntp_servers(servers):
-
     """Calls ntp.delete_servers."""
 
     return __salt__["ntp.delete_servers"](*servers, commit=False)
@@ -185,7 +188,7 @@ def _check_diff_and_configure(fun_name, peers_servers, name="peers"):
     if name not in _options:
         return _ret
 
-    _retrieve_fun = "_retrieve_ntp_{what}".format(what=name)
+    _retrieve_fun = f"_retrieve_ntp_{name}"
     ntp_list_output = _exec_fun(
         _retrieve_fun
     )  # contains only IP Addresses as dictionary keys
@@ -194,6 +197,7 @@ def _check_diff_and_configure(fun_name, peers_servers, name="peers"):
         _ret["comment"] = "Cannot retrieve NTP {what} from the device: {reason}".format(
             what=name, reason=ntp_list_output.get("comment")
         )
+        _ret["successfully_changed"] = False
         return _ret
 
     configured_ntp_list = set(ntp_list_output.get("out", {}))
@@ -202,7 +206,7 @@ def _check_diff_and_configure(fun_name, peers_servers, name="peers"):
     if configured_ntp_list == desired_ntp_list:
         _ret.update(
             {
-                "comment": "NTP {what} already configured as needed.".format(what=name),
+                "comment": f"NTP {name} already configured as needed.",
                 "result": True,
             }
         )
@@ -238,7 +242,7 @@ def _check_diff_and_configure(fun_name, peers_servers, name="peers"):
     comment = ""
 
     if list_to_set:
-        _set_fun = "_set_ntp_{what}".format(what=name)
+        _set_fun = f"_set_ntp_{name}"
         _set = _exec_fun(_set_fun, list_to_set)
         if _set.get("result"):
             expected_config_change = True
@@ -249,7 +253,7 @@ def _check_diff_and_configure(fun_name, peers_servers, name="peers"):
             )
 
     if list_to_delete:
-        _delete_fun = "_delete_ntp_{what}".format(what=name)
+        _delete_fun = f"_delete_ntp_{name}"
         _removed = _exec_fun(_delete_fun, list_to_delete)
         if _removed.get("result"):
             expected_config_change = True
@@ -276,7 +280,6 @@ def _check_diff_and_configure(fun_name, peers_servers, name="peers"):
 
 
 def managed(name, peers=None, servers=None):
-
     """
     Manages the configuration of NTP peers and servers on the device, as specified in the state SLS file.
     NTP entities not specified in these lists will be removed whilst entities not configured on the device will be set.
@@ -334,15 +337,15 @@ def managed(name, peers=None, servers=None):
         return ret  # just exit
 
     if isinstance(peers, list) and not _check(peers):  # check and clean peers
-        ret[
-            "comment"
-        ] = "NTP peers must be a list of valid IP Addresses or Domain Names"
+        ret["comment"] = (
+            "NTP peers must be a list of valid IP Addresses or Domain Names"
+        )
         return ret
 
     if isinstance(servers, list) and not _check(servers):  # check and clean servers
-        ret[
-            "comment"
-        ] = "NTP servers must be a list of valid IP Addresses or Domain Names"
+        ret["comment"] = (
+            "NTP servers must be a list of valid IP Addresses or Domain Names"
+        )
         return ret
 
     # ----- Retrieve existing NTP peers and determine peers to be added/removed --------------------------------------->
@@ -374,6 +377,16 @@ def managed(name, peers=None, servers=None):
             changes["servers"] = _changed_servers
 
     ret.update({"changes": changes})
+
+    if not successfully_changed and not expected_config_change:
+        # A failure with nothing staged (e.g. the device retrieve failed, which
+        # is the case that previously fell through to the "no changes ->
+        # configured properly" branch below and was reported as result=True).
+        # Report it. When something *was* staged before a later step failed
+        # (expected_config_change), fall through so the existing commit path
+        # still deals with the candidate rather than leaving it dangling.
+        ret.update({"result": False, "comment": comment})
+        return ret
 
     if not (changes or expected_config_change):
         ret.update({"result": True, "comment": "Device configured properly."})

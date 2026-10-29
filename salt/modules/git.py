@@ -20,7 +20,7 @@ import salt.utils.stringutils
 import salt.utils.templates
 import salt.utils.url
 from salt.exceptions import CommandExecutionError, SaltInvocationError
-from salt.utils.versions import LooseVersion as _LooseVersion
+from salt.utils.versions import LooseVersion
 
 log = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ def _check_worktree_support(failhard=True):
     Ensure that we don't try to operate on worktrees in git < 2.5.0.
     """
     git_version = version(versioninfo=False)
-    if _LooseVersion(git_version) < _LooseVersion("2.5.0"):
+    if LooseVersion(git_version) < LooseVersion("2.5.0"):
         if failhard:
             raise CommandExecutionError(
                 "Worktrees are only supported in git 2.5.0 and newer "
@@ -61,7 +61,7 @@ def _config_getter(
     password=None,
     ignore_retcode=False,
     output_encoding=None,
-    **kwargs
+    **kwargs,
 ):
     """
     Common code for config.get_* functions, builds and runs the git CLI command
@@ -175,7 +175,7 @@ def _format_git_opts(opts):
     """
     if opts:
         version_ = version(versioninfo=False)
-        if _LooseVersion(version_) < _LooseVersion("1.7.2"):
+        if LooseVersion(version_) < LooseVersion("1.7.2"):
             raise SaltInvocationError(
                 "git_opts is only supported for git versions >= 1.7.2 "
                 "(detected: {})".format(version_)
@@ -224,7 +224,7 @@ def _git_run(
     redirect_stderr=False,
     saltenv="base",
     output_encoding=None,
-    **kwargs
+    **kwargs,
 ):
     """
     simple, throw an exception with the error message on an error return code.
@@ -323,7 +323,7 @@ def _git_run(
                     ignore_retcode=ignore_retcode,
                     redirect_stderr=redirect_stderr,
                     output_encoding=output_encoding,
-                    **kwargs
+                    **kwargs,
                 )
             finally:
                 if tmp_ssh_wrapper:
@@ -390,7 +390,7 @@ def _git_run(
             ignore_retcode=ignore_retcode,
             redirect_stderr=redirect_stderr,
             output_encoding=output_encoding,
-            **kwargs
+            **kwargs,
         )
 
         if result["retcode"] == 0:
@@ -403,12 +403,14 @@ def _git_run(
                 )
                 err = result["stdout" if redirect_stderr else "stderr"]
                 if err:
-                    msg += ": {}".format(salt.utils.url.redact_http_basic_auth(err))
+                    msg += f": {salt.utils.url.redact_http_basic_auth(err)}"
                 raise CommandExecutionError(msg)
             return result
 
 
-def _get_toplevel(path, user=None, password=None, output_encoding=None):
+def _get_toplevel(
+    path, user=None, password=None, ignore_retcode=False, output_encoding=None
+):
     """
     Use git rev-parse to return the top level of a repo
     """
@@ -417,6 +419,7 @@ def _get_toplevel(path, user=None, password=None, output_encoding=None):
         cwd=path,
         user=user,
         password=password,
+        ignore_retcode=ignore_retcode,
         output_encoding=output_encoding,
     )["stdout"]
 
@@ -450,8 +453,8 @@ def _which_git_config(global_, cwd, user, password, output_encoding=None):
     """
     if global_:
         return ["--global"]
-    version_ = _LooseVersion(version(versioninfo=False))
-    if version_ >= _LooseVersion("1.7.10.2"):
+    version_ = LooseVersion(version(versioninfo=False))
+    if version_ >= LooseVersion("1.7.10.2"):
         # --local added in 1.7.10.2
         return ["--local"]
     else:
@@ -564,7 +567,7 @@ def archive(
     password=None,
     ignore_retcode=False,
     output_encoding=None,
-    **kwargs
+    **kwargs,
 ):
     """
     .. versionchanged:: 2015.8.0
@@ -1019,7 +1022,7 @@ def clone(
     https_user
         Set HTTP Basic Auth username. Only accepted for HTTPS URLs.
 
-        .. versionadded:: 20515.5.0
+        .. versionadded:: 2015.5.0
 
     https_pass
         Set HTTP Basic Auth password. Only accepted for HTTPS URLs.
@@ -1067,7 +1070,7 @@ def clone(
             url, https_user, https_pass, https_only=True
         )
     except ValueError as exc:
-        raise SaltInvocationError(exc.__str__())
+        raise SaltInvocationError(str(exc))
 
     command = ["git"] + _format_git_opts(git_opts)
     command.append("clone")
@@ -1215,7 +1218,7 @@ def config_get(
     password=None,
     ignore_retcode=False,
     output_encoding=None,
-    **kwargs
+    **kwargs,
 ):
     """
     Get the value of a key in the git configuration file
@@ -1293,7 +1296,7 @@ def config_get(
         password=password,
         ignore_retcode=ignore_retcode,
         output_encoding=output_encoding,
-        **kwargs
+        **kwargs,
     )
 
     # git config --get exits with retcode of 1 when key does not exist
@@ -1318,7 +1321,7 @@ def config_get_regexp(
     password=None,
     ignore_retcode=False,
     output_encoding=None,
-    **kwargs
+    **kwargs,
 ):
     r"""
     .. versionadded:: 2015.8.0
@@ -1395,7 +1398,7 @@ def config_get_regexp(
         password=password,
         ignore_retcode=ignore_retcode,
         output_encoding=output_encoding,
-        **kwargs
+        **kwargs,
     )
 
     # git config --get exits with retcode of 1 when key does not exist
@@ -1425,7 +1428,7 @@ def config_set(
     password=None,
     ignore_retcode=False,
     output_encoding=None,
-    **kwargs
+    **kwargs,
 ):
     """
     .. versionchanged:: 2015.8.0
@@ -1574,7 +1577,7 @@ def config_set(
         cwd=cwd,
         ignore_retcode=ignore_retcode,
         output_encoding=output_encoding,
-        **{"all": True, "global": global_}
+        **{"all": True, "global": global_},
     )
 
 
@@ -1586,7 +1589,7 @@ def config_unset(
     password=None,
     ignore_retcode=False,
     output_encoding=None,
-    **kwargs
+    **kwargs,
 ):
     """
     .. versionadded:: 2015.8.0
@@ -1695,9 +1698,9 @@ def config_unset(
             )
             is None
         ):
-            raise CommandExecutionError("Key '{}' does not exist".format(key))
+            raise CommandExecutionError(f"Key '{key}' does not exist")
         else:
-            msg = "Multiple values exist for key '{}'".format(key)
+            msg = f"Multiple values exist for key '{key}'"
             if value_regex is not None:
                 msg += " and value_regex matches multiple values"
             raise CommandExecutionError(msg)
@@ -1825,7 +1828,7 @@ def describe(
     """
     cwd = _expand_path(cwd, user)
     command = ["git", "describe"]
-    if _LooseVersion(version(versioninfo=False)) >= _LooseVersion("1.5.6"):
+    if LooseVersion(version(versioninfo=False)) >= LooseVersion("1.5.6"):
         command.append("--always")
     command.append(rev)
     return _git_run(
@@ -1970,7 +1973,7 @@ def diff(
     failhard = True
 
     if no_index:
-        if _LooseVersion(version(versioninfo=False)) < _LooseVersion("1.5.1"):
+        if LooseVersion(version(versioninfo=False)) < LooseVersion("1.5.1"):
             raise CommandExecutionError(
                 "The 'no_index' option is only supported in Git 1.5.1 and newer"
             )
@@ -2355,9 +2358,9 @@ def init(
     if bare:
         command.append("--bare")
     if template is not None:
-        command.append("--template={}".format(template))
+        command.append(f"--template={template}")
     if separate_git_dir is not None:
-        command.append("--separate-git-dir={}".format(separate_git_dir))
+        command.append(f"--separate-git-dir={separate_git_dir}")
     if shared is not None:
         if isinstance(shared, int) and not isinstance(shared, bool):
             shared = "0" + str(shared)
@@ -2365,7 +2368,7 @@ def init(
             # Using lower here because booleans would be capitalized when
             # converted to a string.
             shared = str(shared).lower()
-        command.append("--shared={}".format(shared))
+        command.append(f"--shared={shared}")
     command.extend(_format_opts(opts))
     command.append(cwd)
     return _git_run(
@@ -2418,8 +2421,18 @@ def is_worktree(cwd, user=None, password=None, output_encoding=None):
     """
     cwd = _expand_path(cwd, user)
     try:
+        # This probe is expected to fail (rev-parse returns 128) when cwd is
+        # not a git repository. ignore_retcode=True only suppresses the noisy
+        # ERROR log for that expected case; it does not change how success or
+        # failure is detected. failhard is still True, so _git_run still raises
+        # CommandExecutionError on a nonzero retcode, which we catch below and
+        # turn into a False return.
         toplevel = _get_toplevel(
-            cwd, user=user, password=password, output_encoding=output_encoding
+            cwd,
+            user=user,
+            password=password,
+            ignore_retcode=True,
+            output_encoding=output_encoding,
         )
     except CommandExecutionError:
         return False
@@ -2701,8 +2714,8 @@ def list_worktrees(
 
     tracked_data_points = ("worktree", "HEAD", "branch")
     ret = {}
-    git_version = _LooseVersion(version(versioninfo=False))
-    has_native_list_subcommand = git_version >= _LooseVersion("2.7.0")
+    git_version = LooseVersion(version(versioninfo=False))
+    has_native_list_subcommand = git_version >= LooseVersion("2.7.0")
     if has_native_list_subcommand:
         out = _git_run(
             ["git", "worktree", "list", "--porcelain"],
@@ -2814,7 +2827,7 @@ def list_worktrees(
             worktree_root = os.path.join(cwd, worktree_root)
         if not os.path.isdir(worktree_root):
             raise CommandExecutionError(
-                "Worktree admin directory {} not present".format(worktree_root)
+                f"Worktree admin directory {worktree_root} not present"
             )
 
         def _read_file(path):
@@ -3044,7 +3057,7 @@ def ls_remote(
             remote, https_user, https_pass, https_only=True
         )
     except ValueError as exc:
-        raise SaltInvocationError(exc.__str__())
+        raise SaltInvocationError(str(exc))
     command = ["git"] + _format_git_opts(git_opts)
     command.append("ls-remote")
     command.extend(_format_opts(opts))
@@ -3081,7 +3094,7 @@ def merge(
     identity=None,
     ignore_retcode=False,
     output_encoding=None,
-    **kwargs
+    **kwargs,
 ):
     """
     Interface to `git-merge(1)`_
@@ -3205,7 +3218,7 @@ def merge_base(
     password=None,
     ignore_retcode=False,
     output_encoding=None,
-    **kwargs
+    **kwargs,
 ):
     """
     .. versionadded:: 2015.8.0
@@ -3356,7 +3369,7 @@ def merge_base(
             refs = ["HEAD"]
 
     if is_ancestor:
-        if _LooseVersion(version(versioninfo=False)) < _LooseVersion("1.8.0"):
+        if LooseVersion(version(versioninfo=False)) < LooseVersion("1.8.0"):
             # Pre 1.8.0 git doesn't have --is-ancestor, so the logic here is a
             # little different. First we need to resolve the first ref to a
             # full SHA1, and then if running git merge-base on both commits
@@ -3487,7 +3500,7 @@ def merge_tree(
             base = merge_base(cwd, refs=[ref1, ref2], output_encoding=output_encoding)
         except (SaltInvocationError, CommandExecutionError):
             raise CommandExecutionError(
-                "Unable to determine merge base for {} and {}".format(ref1, ref2)
+                f"Unable to determine merge base for {ref1} and {ref2}"
             )
     command.extend([base, ref1, ref2])
     return _git_run(
@@ -3627,7 +3640,7 @@ def push(
     ignore_retcode=False,
     saltenv="base",
     output_encoding=None,
-    **kwargs
+    **kwargs,
 ):
     """
     Interface to `git-push(1)`_
@@ -3927,7 +3940,7 @@ def remote_get(
     )
     if remote not in all_remotes:
         raise CommandExecutionError(
-            "Remote '{}' not present in git checkout located at {}".format(remote, cwd)
+            f"Remote '{remote}' not present in git checkout located at {cwd}"
         )
     return all_remotes[remote]
 
@@ -3944,7 +3957,7 @@ def remote_refs(
     ignore_retcode=False,
     output_encoding=None,
     saltenv="base",
-    **kwargs
+    **kwargs,
 ):
     """
     .. versionadded:: 2015.8.0
@@ -4051,7 +4064,7 @@ def remote_refs(
             )
         )
     except ValueError as exc:
-        raise SaltInvocationError(exc.__str__())
+        raise SaltInvocationError(str(exc))
     if filter_:
         command.append(filter_)
     output = _git_run(
@@ -4185,7 +4198,7 @@ def remote_set(
             url, https_user, https_pass, https_only=True
         )
     except ValueError as exc:
-        raise SaltInvocationError(exc.__str__())
+        raise SaltInvocationError(str(exc))
     command = ["git", "remote", "add", remote, url]
     _git_run(
         command,
@@ -4850,7 +4863,7 @@ def submodule(
     ignore_retcode=False,
     saltenv="base",
     output_encoding=None,
-    **kwargs
+    **kwargs,
 ):
     """
     .. versionchanged:: 2015.8.0
@@ -5207,6 +5220,10 @@ def tag(
         raise SaltInvocationError(
             'Tag messages must be passed in the "message" argument'
         )
+    if message is not None:
+        # Create an annotated tag with the supplied message. ``-a`` is implied
+        # by ``-m`` but is added explicitly for clarity in command logs.
+        command.extend(["-a", "-m", message])
     command.extend(formatted_opts)
     command.append(name)
     if "-d" not in formatted_opts and "--delete" not in formatted_opts:
@@ -5229,8 +5246,7 @@ def version(versioninfo=False):
     Returns the version of Git installed on the minion
 
     versioninfo : False
-        If ``True``, return the version in a versioninfo list (e.g. ``[2, 5,
-        0]``)
+        If ``True``, return the version in a versioninfo list (e.g. ``[2, 5, 0]``)
 
     CLI Example:
 
@@ -5247,7 +5263,17 @@ def version(versioninfo=False):
             log.error("Failed to obtain the git version (error follows):\n%s", exc)
             version_ = "unknown"
         try:
-            __context__[contextkey] = version_.split()[-1]
+            # On macOS, the git version is displayed in a different format
+            #  git version 2.21.1 (Apple Git-122.3)
+            # On Windows:
+            # git version 2.21.1.windows.1
+            # As opposed to:
+            #  git version 2.21.1
+            if "(" in version_:
+                version_ = version_.split("(")[0].strip()
+            if ".windows" in version_:
+                version_ = version_.split(".windows")[0].strip()
+            __context__[contextkey] = version_.strip().split()[-1].strip()
         except IndexError:
             # Somehow git --version returned no stdout while not raising an
             # error. Should never happen but we should still account for this
@@ -5281,7 +5307,7 @@ def worktree_add(
     password=None,
     ignore_retcode=False,
     output_encoding=None,
-    **kwargs
+    **kwargs,
 ):
     """
     .. versionadded:: 2015.8.0
@@ -5527,14 +5553,18 @@ def worktree_prune(
     if expire:
         command.extend(["--expire", expire])
     command.extend(_format_opts(opts))
-    return _git_run(
+    result = _git_run(
         command,
         cwd=cwd,
         user=user,
         password=password,
         ignore_retcode=ignore_retcode,
         output_encoding=output_encoding,
-    )["stdout"]
+    )
+    git_version = version(versioninfo=False)
+    if LooseVersion(git_version) > LooseVersion("2.35.0"):
+        return result["stderr"]
+    return result["stdout"]
 
 
 def worktree_rm(cwd, user=None, output_encoding=None):
@@ -5589,5 +5619,5 @@ def worktree_rm(cwd, user=None, output_encoding=None):
     try:
         salt.utils.files.rm_rf(cwd)
     except Exception as exc:  # pylint: disable=broad-except
-        raise CommandExecutionError("Unable to remove {}: {}".format(cwd, exc))
+        raise CommandExecutionError(f"Unable to remove {cwd}: {exc}")
     return True

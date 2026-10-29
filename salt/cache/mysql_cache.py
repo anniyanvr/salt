@@ -6,15 +6,21 @@ Minion data cache plugin for MySQL database.
 It is up to the system administrator to set up and configure the MySQL
 infrastructure. All is needed for this plugin is a working MySQL server.
 
-The module requires the `salt_cache` database to exists but creates its own
-table if needed. The keys are indexed using the `bank` and `etcd_key` columns.
+.. warning::
+
+    The mysql.database and mysql.table_name will be directly added into certain
+    queries. Salt treats these as trusted input.
+
+The module requires the database (default ``salt_cache``) to exist but creates
+its own table if needed. The keys are indexed using the ``bank`` and
+``etcd_key`` columns.
 
 To enable this cache plugin, the master will need the python client for
 MySQL installed. This can be easily installed with pip:
 
 .. code-block:: bash
 
-    pip install python-mysql
+    pip install pymysql
 
 Optionally, depending on the MySQL agent configuration, the following values
 could be set in the master config. These are the defaults:
@@ -27,8 +33,10 @@ could be set in the master config. These are the defaults:
     mysql.password: None
     mysql.database: salt_cache
     mysql.table_name: cache
+    # This may be enabled to create a fresh connection on every call
+    mysql.fresh_connection: false
 
-Related docs could be found in the `python-mysql documentation`_.
+Related docs can be found in the `PyMySQL documentation`_.
 
 To use the mysql as a minion data cache backend, set the master ``cache`` config
 value to ``mysql``:
@@ -39,7 +47,7 @@ value to ``mysql``:
 
 
 .. _`MySQL documentation`: https://github.com/coreos/mysql
-.. _`python-mysql documentation`: http://python-mysql.readthedocs.io/en/latest/
+.. _`PyMySQL documentation`: https://pymysql.readthedocs.io/en/latest/
 
 """
 
@@ -54,18 +62,25 @@ from salt.exceptions import SaltCacheError
 try:
     # Trying to import MySQLdb
     import MySQLdb
-    import MySQLdb.cursors
     import MySQLdb.converters
+    import MySQLdb.cursors
     from MySQLdb.connections import OperationalError
+
+    # Define the interface error as a subclass of exception
+    # It will never be thrown/used, it is defined to support the pymysql error below
+    class InterfaceError(Exception):
+        pass
+
 except ImportError:
     try:
         # MySQLdb import failed, try to import PyMySQL
         import pymysql
+        from pymysql.err import InterfaceError
 
         pymysql.install_as_MySQLdb()
         import MySQLdb
-        import MySQLdb.cursors
         import MySQLdb.converters
+        import MySQLdb.cursors
         from MySQLdb.err import OperationalError
     except ImportError:
         MySQLdb = None
@@ -90,17 +105,31 @@ def __virtual__():
     return bool(MySQLdb), "No python mysql client installed." if MySQLdb is None else ""
 
 
-def run_query(conn, query, retries=3, args=None):
+def force_reconnect():
     """
-    Get a cursor and run a query. Reconnect up to `retries` times if
+    Force a reconnection to the MySQL database, by removing the client from
+    Salt's __context__.
+    """
+    __context__.pop("mysql_client", None)
+
+
+def run_query(conn, query, args=None, retries=3):
+    """
+    Get a cursor and run a query. Reconnect up to ``retries`` times if
     needed.
     Returns: cursor, affected rows counter
-    Raises: SaltCacheError, AttributeError, OperationalError
+    Raises: SaltCacheError, AttributeError, OperationalError, InterfaceError
     """
+    if __context__.get("mysql_fresh_connection"):
+        # Create a new connection if configured
+        conn = MySQLdb.connect(**__context__["mysql_kwargs"])
+        __context__["mysql_client"] = conn
+    if conn is None:
+        conn = __context__.get("mysql_client")
     try:
         cur = conn.cursor()
 
-        if args is None or args == {}:
+        if not args:
             log.debug("Doing query: %s", query)
             out = cur.execute(query)
         else:
@@ -108,7 +137,7 @@ def run_query(conn, query, retries=3, args=None):
             out = cur.execute(query, args)
 
         return cur, out
-    except (AttributeError, OperationalError) as e:
+    except (AttributeError, OperationalError, InterfaceError) as e:
         if retries == 0:
             raise
         # reconnect creating new client
@@ -118,11 +147,18 @@ def run_query(conn, query, retries=3, args=None):
         else:
             log.info("mysql_cache: recreating db connection due to: %r", e)
         __context__["mysql_client"] = MySQLdb.connect(**__context__["mysql_kwargs"])
-        return run_query(__context__["mysql_client"], query, args, retries - 1)
+        return run_query(
+            conn=__context__.get("mysql_client"),
+            query=query,
+            args=args,
+            retries=(retries - 1),
+        )
     except Exception as e:  # pylint: disable=broad-except
         if len(query) > 150:
             query = query[:150] + "<...>"
-        raise SaltCacheError("Error running {}: {}".format(query, e))
+        raise SaltCacheError(
+            "Error running {}{}: {}".format(query, f"- args: {args}" if args else "", e)
+        )
 
 
 def _create_table():
@@ -132,26 +168,59 @@ def _create_table():
     # Explicitly check if the table already exists as the library logs a
     # warning on CREATE TABLE
     query = """SELECT COUNT(TABLE_NAME) FROM information_schema.tables
-        WHERE table_schema = '{}' AND table_name = '{}'""".format(
-        __context__["mysql_kwargs"]["db"],
-        __context__["mysql_table_name"],
+        WHERE table_schema = %s AND table_name = %s"""
+    cur, _ = run_query(
+        __context__.get("mysql_client"),
+        query,
+        args=(__context__["mysql_kwargs"]["db"], __context__["mysql_table_name"]),
     )
-    cur, _ = run_query(__context__.get("mysql_client"), query)
     r = cur.fetchone()
     cur.close()
     if r[0] == 1:
-        return
+        query = """
+        SELECT COUNT(TABLE_NAME)
+        FROM
+            information_schema.columns
+        WHERE
+            table_schema = %s
+            AND table_name = %s
+            AND column_name = 'last_update'
+        """
+        cur, _ = run_query(
+            __context__["mysql_client"],
+            query,
+            args=(__context__["mysql_kwargs"]["db"], __context__["mysql_table_name"]),
+        )
+        r = cur.fetchone()
+        cur.close()
+        if r[0] == 1:
+            return
+        else:
+            query = """
+            ALTER TABLE {}.{}
+            ADD COLUMN last_update TIMESTAMP NOT NULL
+                                   DEFAULT CURRENT_TIMESTAMP
+                                   ON UPDATE CURRENT_TIMESTAMP
+            """.format(
+                __context__["mysql_kwargs"]["db"], __context__["mysql_table_name"]
+            )
+            cur, _ = run_query(__context__["mysql_client"], query)
+            cur.close()
+            return
 
     query = """CREATE TABLE IF NOT EXISTS {} (
       bank CHAR(255),
       etcd_key CHAR(255),
       data MEDIUMBLOB,
+      last_update TIMESTAMP NOT NULL
+                  DEFAULT CURRENT_TIMESTAMP
+                  ON UPDATE CURRENT_TIMESTAMP,
       PRIMARY KEY(bank, etcd_key)
     );""".format(
         __context__["mysql_table_name"]
     )
     log.info("mysql_cache: creating table %s", __context__["mysql_table_name"])
-    cur, _ = run_query(__context__["mysql_client"], query)
+    cur, _ = run_query(__context__.get("mysql_client"), query)
     cur.close()
 
 
@@ -174,6 +243,7 @@ def _init_client():
     mysql_kwargs["autocommit"] = True
 
     __context__["mysql_table_name"] = opts.pop("mysql.table_name", "salt")
+    __context__["mysql_fresh_connection"] = opts.pop("mysql.fresh_connection", False)
 
     # Gather up any additional MySQL configuration options
     for k in opts:
@@ -203,13 +273,12 @@ def store(bank, key, data):
     query = "REPLACE INTO {} (bank, etcd_key, data) values(%s,%s,%s)".format(
         __context__["mysql_table_name"]
     )
-    query = salt.utils.stringutils.to_bytes(query)
     args = (bank, key, data)
 
-    cur, cnt = run_query(__context__.get("mysql_client"), query, args)
+    cur, cnt = run_query(__context__.get("mysql_client"), query, args=args)
     cur.close()
     if cnt not in (1, 2):
-        raise SaltCacheError("Error storing {} {} returned {}".format(bank, key, cnt))
+        raise SaltCacheError(f"Error storing {bank} {key} returned {cnt}")
 
 
 def fetch(bank, key):
@@ -217,10 +286,10 @@ def fetch(bank, key):
     Fetch a key value.
     """
     _init_client()
-    query = "SELECT data FROM {} WHERE bank='{}' AND etcd_key='{}'".format(
-        __context__["mysql_table_name"], bank, key
+    query = "SELECT data FROM {} WHERE bank=%s AND etcd_key=%s".format(
+        __context__["mysql_table_name"]
     )
-    cur, _ = run_query(__context__.get("mysql_client"), query)
+    cur, _ = run_query(__context__.get("mysql_client"), query, args=(bank, key))
     r = cur.fetchone()
     cur.close()
     if r is None:
@@ -233,13 +302,14 @@ def flush(bank, key=None):
     Remove the key from the cache bank with all the key content.
     """
     _init_client()
-    query = "DELETE FROM {} WHERE bank='{}'".format(
-        __context__["mysql_table_name"], bank
-    )
-    if key is not None:
-        query += " AND etcd_key='{}'".format(key)
+    query = "DELETE FROM {} WHERE bank=%s".format(__context__["mysql_table_name"])
+    if key is None:
+        data = (bank,)
+    else:
+        data = (bank, key)
+        query += " AND etcd_key=%s"
 
-    cur, _ = run_query(__context__.get("mysql_client"), query)
+    cur, _ = run_query(__context__.get("mysql_client"), query, args=data)
     cur.close()
 
 
@@ -249,13 +319,40 @@ def ls(bank):
     bank.
     """
     _init_client()
-    query = "SELECT etcd_key FROM {} WHERE bank='{}'".format(
-        __context__["mysql_table_name"], bank
+    # Return both direct keys in this bank AND first-level sub-bank names.
+    # MySQL stores entries flat; a "sub-bank" is a row whose bank column
+    # starts with <bank>/.  Direct keys have bank == <bank> exactly.
+    out = set()
+
+    # Query 1: direct keys (etcd_key) for rows whose bank exactly matches.
+    query = "SELECT etcd_key FROM {} WHERE bank=%s".format(
+        __context__["mysql_table_name"]
     )
-    cur, _ = run_query(__context__.get("mysql_client"), query)
-    out = [row[0] for row in cur.fetchall()]
+    cur, _ = run_query(__context__.get("mysql_client"), query, args=(bank,))
+    for row in cur.fetchall():
+        out.add(row[0])
     cur.close()
-    return out
+
+    # Query 2: first-level sub-bank names for rows nested below this bank.
+    bank_path = bank + "/"
+    # SUBSTR(bank, N) strips the "<bank>/" prefix (MySQL SUBSTR is 1-indexed);
+    # SUBSTRING_INDEX(..., '/', 1) keeps only the first path component so
+    # deeper nesting doesn't leak through.
+    prefix_len = len(bank_path) + 1
+    query = (
+        "SELECT DISTINCT SUBSTRING_INDEX(SUBSTR(bank, %s), '/', 1)"
+        " FROM {} WHERE bank LIKE %s".format(__context__["mysql_table_name"])
+    )
+    cur, _ = run_query(
+        __context__.get("mysql_client"),
+        query,
+        args=(prefix_len, bank_path + "%"),
+    )
+    for row in cur.fetchall():
+        out.add(row[0])
+    cur.close()
+
+    return list(out)
 
 
 def contains(bank, key):
@@ -263,10 +360,34 @@ def contains(bank, key):
     Checks if the specified bank contains the specified key.
     """
     _init_client()
-    query = "SELECT COUNT(data) FROM {} WHERE bank='{}' AND etcd_key='{}'".format(
-        __context__["mysql_table_name"], bank, key
-    )
-    cur, _ = run_query(__context__.get("mysql_client"), query)
+    if key is None:
+        data = (bank,)
+        query = "SELECT COUNT(data) FROM {} WHERE bank=%s".format(
+            __context__["mysql_table_name"]
+        )
+    else:
+        data = (bank, key)
+        query = "SELECT COUNT(data) FROM {} WHERE bank=%s AND etcd_key=%s".format(
+            __context__["mysql_table_name"]
+        )
+    cur, _ = run_query(__context__.get("mysql_client"), query, args=data)
     r = cur.fetchone()
     cur.close()
     return r[0] == 1
+
+
+def updated(bank, key):
+    """
+    Return the integer Unix epoch update timestamp of the specified bank and
+    key.
+    """
+    _init_client()
+    query = (
+        "SELECT UNIX_TIMESTAMP(last_update) FROM {} WHERE bank=%s "
+        "AND etcd_key=%s".format(__context__["mysql_table_name"])
+    )
+    data = (bank, key)
+    cur, _ = run_query(__context__.get("mysql_client"), query=query, args=data)
+    r = cur.fetchone()
+    cur.close()
+    return int(r[0]) if r else r

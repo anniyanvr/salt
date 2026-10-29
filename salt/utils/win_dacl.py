@@ -2,6 +2,7 @@
 ============
 Windows DACL
 ============
+
 This salt utility contains objects and functions for setting permissions to
 objects in Windows. You can use the built in functions or access the objects
 directly to create your own custom functionality. There are two objects, Flags
@@ -62,17 +63,22 @@ permissions you see when you look at the security for an object.
     =======================  ====  ========  =======  =======
     Permissions              File  Registry  Printer  Service
     =======================  ====  ========  =======  =======
+    *** folder permissions
     list_folder              X
-    read_data                X
     create_files             X
-    write_data               X
     create_folders           X
+    traverse_folder          X
+    delete_subfolders_files  X
+
+    *** file permissions
+    read_data                X
+    write_data               X
     append_data              X
+    execute_file             X
+
+    *** common permissions
     read_ea                  X
     write_ea                 X
-    traverse_folder          X
-    execute_file             X
-    delete_subfolders_files  X
     read_attributes          X
     write_attributes         X
     delete                   X     X
@@ -119,6 +125,11 @@ should match what you see when you look at the properties for an object.
         - subfolders_only: Applies to all containers beneath this object
         - files_only: Applies to all file objects beneath this object
 
+    .. note::
+
+        'applies to' properties can only be modified on directories. Files
+        will always be ``this_folder_only``.
+
     **Registry types:**
 
         - this_key_only: Applies only to this key
@@ -135,10 +146,10 @@ from salt.exceptions import CommandExecutionError, SaltInvocationError
 
 HAS_WIN32 = False
 try:
-    import win32security
-    import win32con
-    import win32api
     import pywintypes
+    import win32api
+    import win32con
+    import win32security
 
     HAS_WIN32 = True
 except ImportError:
@@ -216,17 +227,20 @@ def flags(instantiated=True):
                     0x40000: "Change permissions",
                     0x80000: "Take ownership",
                     # 0x100000: 'SYNCHRONIZE',  # This is in all of them
+                    # Directory permissions
                     "list_folder": 0x0001,
-                    "read_data": 0x0001,
                     "create_files": 0x0002,
-                    "write_data": 0x0002,
                     "create_folders": 0x0004,
+                    "traverse_folder": 0x0020,
+                    "delete_subfolders_files": 0x0040,
+                    # File permissions
+                    "read_data": 0x0001,
+                    "write_data": 0x0002,
                     "append_data": 0x0004,
+                    "execute_file": 0x0020,
+                    # Common permissions
                     "read_ea": 0x0008,
                     "write_ea": 0x0010,
-                    "traverse_folder": 0x0020,
-                    "execute_file": 0x0020,
-                    "delete_subfolders_files": 0x0040,
                     "read_attributes": 0x0080,
                     "write_attributes": 0x0100,
                     "delete": 0x10000,
@@ -358,25 +372,27 @@ def flags(instantiated=True):
         # 0x0002 : win32security.CONTAINER_INHERIT_ACE
         # 0x0004 : win32security.NO_PROPAGATE_INHERIT_ACE
         # 0x0008 : win32security.INHERIT_ONLY_ACE
+
+        # These values only apply to directories. Files will always return
+        # "This folder only"
         ace_prop = {
             "file": {
                 # for report
-                0x0000: "Not Inherited (file)",
+                0x0000: "This folder only",
                 0x0001: "This folder and files",
                 0x0002: "This folder and subfolders",
                 0x0003: "This folder, subfolders and files",
-                0x0006: "This folder only",
                 0x0009: "Files only",
                 0x000A: "Subfolders only",
                 0x000B: "Subfolders and files only",
                 # for setting
-                "this_folder_only": 0x0006,
-                "this_folder_subfolders_files": 0x0003,
-                "this_folder_subfolders": 0x0002,
+                "this_folder_only": 0x0000,
                 "this_folder_files": 0x0001,
-                "subfolders_files": 0x000B,
-                "subfolders_only": 0x000A,
+                "this_folder_subfolders": 0x0002,
+                "this_folder_subfolders_files": 0x0003,
                 "files_only": 0x0009,
+                "subfolders_only": 0x000A,
+                "subfolders_files": 0x000B,
             },
             "registry": {
                 0x0000: "This key only",
@@ -480,9 +496,7 @@ def dacl(obj_name=None, obj_type="file"):
             """
             # Validate obj_type
             if obj_type.lower() not in self.obj_type:
-                raise SaltInvocationError(
-                    'Invalid "obj_type" passed: {}'.format(obj_type)
-                )
+                raise SaltInvocationError(f'Invalid "obj_type" passed: {obj_type}')
 
             self.dacl_type = obj_type.lower()
 
@@ -498,7 +512,7 @@ def dacl(obj_name=None, obj_type="file"):
                     )
                 except pywintypes.error as exc:
                     if "The system cannot find" in exc.strerror:
-                        msg = "System cannot find {}".format(obj_name)
+                        msg = f"System cannot find {obj_name}"
                         log.exception(msg)
                         raise CommandExecutionError(msg)
                     raise
@@ -572,9 +586,7 @@ def dacl(obj_name=None, obj_type="file"):
                 valid_hive = hives[passed_hive.upper()]
             except KeyError:
                 log.exception("Invalid Registry Hive: %s", passed_hive)
-                raise CommandExecutionError(
-                    "Invalid Registry Hive: {}".format(passed_hive)
-                )
+                raise CommandExecutionError(f"Invalid Registry Hive: {passed_hive}")
 
             reg.insert(0, valid_hive)
 
@@ -616,7 +628,7 @@ def dacl(obj_name=None, obj_type="file"):
 
             if applies_to not in self.ace_prop[self.dacl_type]:
                 raise SaltInvocationError(
-                    "Invalid 'applies_to' for type {}".format(self.dacl_type)
+                    f"Invalid 'applies_to' for type {self.dacl_type}"
                 )
 
             if self.dacl is None:
@@ -628,20 +640,20 @@ def dacl(obj_name=None, obj_type="file"):
                 try:
                     perm_flag = self.ace_perms[self.dacl_type]["basic"][permissions]
                 except KeyError as exc:
-                    msg = "Invalid permission specified: {}".format(permissions)
+                    msg = f"Invalid permission specified: {permissions}"
                     log.exception(msg)
                     raise CommandExecutionError(msg, exc)
             else:
-                try:
-                    for perm in permissions:
+                for perm in permissions:
+                    try:
                         perm_flag |= self.ace_perms[self.dacl_type]["advanced"][perm]
-                except KeyError as exc:
-                    msg = "Invalid permission specified: {}".format(perm)
-                    log.exception(msg)
-                    raise CommandExecutionError(msg, exc)
+                    except KeyError as exc:
+                        msg = f"Invalid permission specified: {perm}"
+                        log.exception(msg)
+                        raise CommandExecutionError(msg, exc)
 
             if access_mode.lower() not in ["grant", "deny"]:
-                raise SaltInvocationError("Invalid Access Mode: {}".format(access_mode))
+                raise SaltInvocationError(f"Invalid Access Mode: {access_mode}")
 
             # Add ACE to the DACL
             # Grant or Deny
@@ -670,11 +682,9 @@ def dacl(obj_name=None, obj_type="file"):
                     )
                 else:
                     log.exception("Invalid access mode: %s", access_mode)
-                    raise SaltInvocationError(
-                        "Invalid access mode: {}".format(access_mode)
-                    )
+                    raise SaltInvocationError(f"Invalid access mode: {access_mode}")
             except Exception as exc:  # pylint: disable=broad-except
-                return False, "Error: {}".format(exc)
+                return False, f"Error: {exc}"
 
             return True
 
@@ -873,10 +883,7 @@ def dacl(obj_name=None, obj_type="file"):
             """
             # Get the principal from the sid (object sid)
             sid = win32security.ConvertSidToStringSid(ace[2])
-            try:
-                principal = get_name(sid)
-            except CommandExecutionError:
-                principal = sid
+            principal = get_name(sid)
 
             # Get the ace type
             ace_type = self.ace_type[ace[0][0]]
@@ -929,7 +936,7 @@ def dacl(obj_name=None, obj_type="file"):
 
             # If still nothing, it must be undefined
             if not ace_perms:
-                ace_perms = ["Undefined Permission: {}".format(ace[1])]
+                ace_perms = [f"Undefined Permission: {ace[1]}"]
 
             return (
                 principal,
@@ -985,7 +992,7 @@ def dacl(obj_name=None, obj_type="file"):
                         offset += 1
 
             if not ret:
-                ret = ["ACE not found for {}".format(principal)]
+                ret = [f"ACE not found for {principal}"]
 
             return ret
 
@@ -1084,7 +1091,7 @@ def dacl(obj_name=None, obj_type="file"):
                 )
             except pywintypes.error as exc:
                 raise CommandExecutionError(
-                    "Failed to set permissions: {}".format(obj_name), exc.strerror
+                    f"Failed to set permissions: {obj_name}", exc.strerror
                 )
 
             return True
@@ -1130,7 +1137,7 @@ def get_sid(principal):
         sid = win32security.ConvertStringSidToSid(sid)
     except pywintypes.error:
         log.exception("Invalid user/group or sid: %s", principal)
-        raise CommandExecutionError("Invalid user/group or sid: {}".format(principal))
+        raise CommandExecutionError(f"Invalid user/group or sid: {principal}")
     except TypeError:
         raise CommandExecutionError
 
@@ -1173,7 +1180,7 @@ def get_sid_string(principal):
         return win32security.ConvertSidToStringSid(principal)
     except pywintypes.error:
         log.exception("Invalid principal %s", principal)
-        raise CommandExecutionError("Invalid principal {}".format(principal))
+        raise CommandExecutionError(f"Invalid principal {principal}")
 
 
 def get_name(principal):
@@ -1184,14 +1191,17 @@ def get_name(principal):
 
         principal (str):
             Find the Normalized name based on this. Can be a PySID object, a SID
-            string, or a user name in any capitalization.
+            string, or a username in any capitalization.
 
             .. note::
-                Searching based on the user name can be slow on hosts connected
+                Searching based on the username can be slow on hosts connected
                 to large Active Directory domains.
 
     Returns:
-        str: The name that corresponds to the passed principal
+        str: The username that corresponds to the passed principal. If there is
+             no corresponding username, the string SID will be returned.
+             Capability SIDs will return ``None``.
+
 
     Usage:
 
@@ -1222,9 +1232,21 @@ def get_name(principal):
                 sid_obj = principal
 
     # By now we should have a valid PySID object
+    str_sid = get_sid_string(sid_obj)
+
     try:
-        return win32security.LookupAccountSid(None, sid_obj)[0]
-    except (pywintypes.error, TypeError) as exc:
+        name = win32security.LookupAccountSid(None, sid_obj)[0]
+
+        # Let's Check for Virtual Service Accounts
+        # Virtual Accounts must be prepended with NT Service in order to resolve
+        # properly
+        # https://docs.microsoft.com/en-us/previous-versions/technet-magazine/cc138011(v=msdn.10)
+        # https://docs.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2008-R2-and-2008/dd548356(v=ws.10)
+        if str_sid.startswith("S-1-5-80"):
+            name = f"NT Service\\{name}"
+
+        return name
+    except pywintypes.error as exc:
         # Microsoft introduced the concept of Capability SIDs in Windows 8
         # https://docs.microsoft.com/en-us/windows/security/identity-protection/access-control/security-identifiers#capability-sids
         # https://support.microsoft.com/en-us/help/4502539/some-sids-do-not-resolve-into-friendly-names
@@ -1232,12 +1254,27 @@ def get_name(principal):
         # These types of SIDs do not resolve, so we'll just ignore them for this
         # All capability SIDs begin with `S-1-15-3`, so we'll only throw an
         # error when the sid does not begin with `S-1-15-3`
-        str_sid = get_sid_string(sid_obj)
-        if not str_sid.startswith("S-1-15-3"):
-            message = 'Error resolving "{}"'.format(principal)
-            if type(exc) == pywintypes.error:
-                win_error = win32api.FormatMessage(exc.winerror).rstrip("\n")
-                message = "{}: {}".format(message, win_error)
+        # 1332: No mapping between account names and security IDs was done
+        if exc.winerror == 1332:
+            # Capability SID, return None
+            if str_sid.startswith("S-1-15-3"):
+                log.debug("Name mapping not available for capability SID: %s", str_sid)
+                return None
+
+            # User does not exist on the system or is on a disconnected domain
+            # Return the SID
+            else:
+                log.debug(
+                    "Could not resolve SID: %s\nThe user has either been removed "
+                    "from the system or is a domain user and the system is not "
+                    "connected to the domain",
+                    str_sid,
+                )
+                return str_sid
+
+        # Some other unknown error
+        else:
+            message = f'Error resolving "{principal}: {exc.strerror}"'
             log.exception(message)
             raise CommandExecutionError(message, exc)
 
@@ -1299,7 +1336,7 @@ def get_owner(obj_name, obj_type="file"):
     try:
         obj_type_flag = flags().obj_type[obj_type.lower()]
     except KeyError:
-        raise SaltInvocationError('Invalid "obj_type" passed: {}'.format(obj_type))
+        raise SaltInvocationError(f'Invalid "obj_type" passed: {obj_type}')
 
     if obj_type in ["registry", "registry32"]:
         obj_name = dacl().get_reg_name(obj_name)
@@ -1321,7 +1358,7 @@ def get_owner(obj_name, obj_type="file"):
         else:
             log.exception("Failed to get the owner: %s", obj_name)
             raise CommandExecutionError(
-                "Failed to get owner: {}".format(obj_name), exc.strerror
+                f"Failed to get owner: {obj_name}", exc.strerror
             )
 
     return get_name(owner_sid)
@@ -1384,7 +1421,7 @@ def get_primary_group(obj_name, obj_type="file"):
     try:
         obj_type_flag = flags().obj_type[obj_type.lower()]
     except KeyError:
-        raise SaltInvocationError('Invalid "obj_type" passed: {}'.format(obj_type))
+        raise SaltInvocationError(f'Invalid "obj_type" passed: {obj_type}')
 
     if "registry" in obj_type.lower():
         obj_name = dacl().get_reg_name(obj_name)
@@ -1407,7 +1444,7 @@ def get_primary_group(obj_name, obj_type="file"):
         else:
             log.exception("Failed to get the primary group: %s", obj_name)
             raise CommandExecutionError(
-                "Failed to get primary group: {}".format(obj_name), exc.strerror
+                f"Failed to get primary group: {obj_name}", exc.strerror
             )
 
     return get_name(win32security.ConvertSidToStringSid(primary_group_gid))
@@ -1449,7 +1486,7 @@ def set_owner(obj_name, principal, obj_type="file"):
 
     # Validate obj_type
     if obj_type.lower() not in obj_flags.obj_type:
-        raise SaltInvocationError('Invalid "obj_type" passed: {}'.format(obj_type))
+        raise SaltInvocationError(f'Invalid "obj_type" passed: {obj_type}')
 
     if "registry" in obj_type.lower():
         obj_name = dacl().get_reg_name(obj_name)
@@ -1486,9 +1523,7 @@ def set_owner(obj_name, principal, obj_type="file"):
         )
     except pywintypes.error as exc:
         log.exception("Failed to make %s the owner: %s", principal, exc)
-        raise CommandExecutionError(
-            "Failed to set owner: {}".format(obj_name), exc.strerror
-        )
+        raise CommandExecutionError(f"Failed to set owner: {obj_name}", exc.strerror)
 
     return True
 
@@ -1534,7 +1569,7 @@ def set_primary_group(obj_name, principal, obj_type="file"):
 
     # Validate obj_type
     if obj_type.lower() not in obj_flags.obj_type:
-        raise SaltInvocationError('Invalid "obj_type" passed: {}'.format(obj_type))
+        raise SaltInvocationError(f'Invalid "obj_type" passed: {obj_type}')
 
     if "registry" in obj_type.lower():
         obj_name = dacl().get_reg_name(obj_name)
@@ -1572,7 +1607,7 @@ def set_primary_group(obj_name, principal, obj_type="file"):
     except pywintypes.error as exc:
         log.exception("Failed to make %s the primary group: %s", principal, exc)
         raise CommandExecutionError(
-            "Failed to set primary group: {}".format(obj_name), exc.strerror
+            f"Failed to set primary group: {obj_name}", exc.strerror
         )
 
     return True
@@ -1785,18 +1820,14 @@ def has_permission(
     .. code-block:: python
 
         # Does Joe have read permissions to C:\Temp
-        salt.utils.win_dacl.has_permission(
-            'C:\\Temp', 'joe', 'read', 'grant', False)
+        salt.utils.win_dacl.has_permission('C:\\Temp', 'joe', 'read', 'grant', exact=False)
 
         # Does Joe have Full Control of C:\Temp
-        salt.utils.win_dacl.has_permission(
-            'C:\\Temp', 'joe', 'full_control', 'grant')
+        salt.utils.win_dacl.has_permission('C:\\Temp', 'joe', 'full_control', 'grant')
     """
     # Validate access_mode
     if access_mode.lower() not in ["grant", "deny"]:
-        raise SaltInvocationError(
-            'Invalid "access_mode" passed: {}'.format(access_mode)
-        )
+        raise SaltInvocationError(f'Invalid "access_mode" passed: {access_mode}')
     access_mode = access_mode.lower()
 
     # Get the DACL
@@ -1813,7 +1844,7 @@ def has_permission(
         obj_dacl.ace_perms[obj_type]["advanced"].get(permission.lower(), False),
     )
     if not chk_flag:
-        raise SaltInvocationError('Invalid "permission" passed: {}'.format(permission))
+        raise SaltInvocationError(f'Invalid "permission" passed: {permission}')
 
     # Check each ace for sid and type
     cur_flag = None
@@ -1875,13 +1906,11 @@ def has_permissions(
 
     .. code-block:: python
 
-        # Does Joe have read permissions to C:\Temp
-        salt.utils.win_dacl.has_permission(
-            'C:\\Temp', 'joe', 'read', 'grant', False)
+        # Does Joe have read and write permissions to C:\Temp
+        salt.utils.win_dacl.has_permission('C:\\Temp', 'joe', ['read', 'write'], 'grant', exact=False)
 
         # Does Joe have Full Control of C:\Temp
-        salt.utils.win_dacl.has_permission(
-            'C:\\Temp', 'joe', 'full_control', 'grant')
+        salt.utils.win_dacl.has_permissions('C:\\Temp', 'joe', 'full_control', 'grant')
     """
     # If this is a single permission, use has_permission function
     if isinstance(permissions, str):
@@ -1896,9 +1925,7 @@ def has_permissions(
 
     # Validate access_mode
     if access_mode.lower() not in ["grant", "deny"]:
-        raise SaltInvocationError(
-            'Invalid "access_mode" passed: {}'.format(access_mode)
-        )
+        raise SaltInvocationError(f'Invalid "access_mode" passed: {access_mode}')
     access_mode = access_mode.lower()
 
     # Get the DACL
@@ -1917,9 +1944,7 @@ def has_permissions(
             obj_dacl.ace_perms[obj_type]["advanced"].get(permission.lower(), False),
         )
         if not chk_flag:
-            raise SaltInvocationError(
-                'Invalid "permission" passed: {}'.format(permission)
-            )
+            raise SaltInvocationError(f'Invalid "permission" passed: {permission}')
 
     # Check each ace for sid and type
     cur_flag = None
@@ -1975,7 +2000,7 @@ def set_inheritance(obj_name, enabled, obj_type="file", clear=False):
     """
     if obj_type not in ["file", "registry", "registry32"]:
         raise SaltInvocationError(
-            "obj_type called with incorrect parameter: {}".format(obj_name)
+            f"obj_type called with incorrect parameter: {obj_name}"
         )
 
     if clear:
@@ -2138,7 +2163,7 @@ def copy_security(
     try:
         obj_type_flag = flags().obj_type[obj_type.lower()]
     except KeyError:
-        raise SaltInvocationError('Invalid "obj_type" passed: {}'.format(obj_type))
+        raise SaltInvocationError(f'Invalid "obj_type" passed: {obj_type}')
 
     security_flags = 0
     if copy_owner:
@@ -2191,9 +2216,7 @@ def copy_security(
             target, obj_type_flag, security_flags, sd_sid, sd_gid, sd_dacl, sd_sacl
         )
     except pywintypes.error as exc:
-        raise CommandExecutionError(
-            "Failed to set security info: {}".format(exc.strerror)
-        )
+        raise CommandExecutionError(f"Failed to set security info: {exc.strerror}")
 
     return True
 
@@ -2231,17 +2254,23 @@ def _check_perms(obj_name, obj_type, new_perms, access_mode, ret, test_mode=Fals
         dict: A dictionary of return data as expected by the state system
     """
     access_mode = access_mode.lower()
-    perms_label = "{}_perms".format(access_mode)
+    perms_label = f"{access_mode}_perms"
     cur_perms = get_permissions(obj_name=obj_name, obj_type=obj_type)
     changes = {}
     for user in new_perms:
-        applies_to_text = ""
         # Check that user exists:
-        try:
-            user_name = get_name(principal=user)
-        except CommandExecutionError:
+        user_name = get_name(principal=user)
+        # username will be the SID if there is no corresponding username
+        if user_name == get_sid_string(principal=user):
             ret["comment"].append(
-                '{} Perms: User "{}" missing from Target System'.format(
+                "{} Perms: Could not find a corresponding username for: {}".format(
+                    access_mode.capitalize(), user
+                )
+            )
+            continue
+        if user_name is None:
+            ret["comment"].append(
+                "{} Perms: Skipping Capability SID: {}".format(
                     access_mode.capitalize(), user
                 )
             )
@@ -2326,7 +2355,7 @@ def check_perms(
     deny_perms=None,
     inheritance=True,
     reset=False,
-    test_mode=None,
+    test_mode=False,
 ):
     """
     Check owner and permissions for the passed directory. This function checks
@@ -2406,12 +2435,9 @@ def check_perms(
                                           }
                                       })
     """
-    if test_mode is None:
-        test_mode = __opts__["test"]
-
     # Validate obj_type
     if obj_type.lower() not in flags().obj_type:
-        raise SaltInvocationError('Invalid "obj_type" passed: {}'.format(obj_type))
+        raise SaltInvocationError(f'Invalid "obj_type" passed: {obj_type}')
 
     obj_type = obj_type.lower()
 
@@ -2437,9 +2463,7 @@ def check_perms(
                     ret["changes"]["owner"] = owner
                 except CommandExecutionError:
                     ret["result"] = False
-                    ret["comment"].append(
-                        'Failed to change owner to "{}"'.format(owner)
-                    )
+                    ret["comment"].append(f'Failed to change owner to "{owner}"')
 
     # Check inheritance
     if inheritance is not None:
@@ -2469,7 +2493,7 @@ def check_perms(
         log.debug("Resetting permissions for %s", obj_name)
         cur_perms = get_permissions(obj_name=obj_name, obj_type=obj_type)
         for user_name in cur_perms["Not Inherited"]:
-            # case insensitive dictionary search
+            # case-insensitive dictionary search
             if user_name not in {get_name(k) for k in (grant_perms or {})}:
                 if "grant" in cur_perms["Not Inherited"][user_name]:
                     ret["changes"].setdefault("remove_perms", {})
@@ -2487,7 +2511,7 @@ def check_perms(
                         ret["changes"]["remove_perms"].update(
                             {user_name: cur_perms["Not Inherited"][user_name]}
                         )
-            # case insensitive dictionary search
+            # case-insensitive dictionary search
             if user_name not in {get_name(k) for k in (deny_perms or {})}:
                 if "deny" in cur_perms["Not Inherited"][user_name]:
                     ret["changes"].setdefault("remove_perms", {})
@@ -2539,7 +2563,7 @@ def check_perms(
         log.debug("Resetting permissions for %s", obj_name)
         cur_perms = get_permissions(obj_name=obj_name, obj_type=obj_type)
         for user_name in cur_perms["Not Inherited"]:
-            # case insensitive dictionary search
+            # case-insensitive dictionary search
             if user_name not in {get_name(k) for k in (grant_perms or {})}:
                 if "grant" in cur_perms["Not Inherited"][user_name]:
                     rm_permissions(
@@ -2548,7 +2572,7 @@ def check_perms(
                         ace_type="grant",
                         obj_type=obj_type,
                     )
-            # case insensitive dictionary search
+            # case-insensitive dictionary search
             if user_name not in {get_name(k) for k in (deny_perms or {})}:
                 if "deny" in cur_perms["Not Inherited"][user_name]:
                     rm_permissions(
@@ -2580,14 +2604,9 @@ def _set_perms(obj_dacl, obj_type, new_perms, cur_perms, access_mode):
     ret = {}
     for user in new_perms:
         # Check that user exists:
-        try:
-            user_name = get_name(user)
-        except CommandExecutionError:
-            log.debug(
-                '%s Perms: User "%s" missing from Target System',
-                access_mode.capitalize(),
-                user,
-            )
+        user_name = get_name(user)
+        # We want to skip unmapped usernames
+        if user_name == get_sid_string(user):
             continue
 
         # Get applies_to

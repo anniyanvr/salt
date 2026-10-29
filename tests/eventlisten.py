@@ -5,8 +5,7 @@ what the sock_dir is.
 This script is a generic tool to test event output
 """
 
-
-import optparse
+import optparse  # pylint: disable=deprecated-module
 import os
 import pprint
 import time
@@ -110,7 +109,6 @@ def listen(opts):
     event = salt.utils.event.get_event(
         opts["node"],
         sock_dir=opts["sock_dir"],
-        transport=opts["transport"],
         opts=opts,
         listen=True,
     )
@@ -136,7 +134,7 @@ def listen(opts):
                         )
                     continue
         else:
-            print("Event fired at {}".format(time.asctime()))
+            print(f"Event fired at {time.asctime()}")
             print("*" * 25)
             print("Tag: {}".format(ret["tag"]))
             print("Data:")

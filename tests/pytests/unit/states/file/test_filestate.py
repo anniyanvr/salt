@@ -1,23 +1,21 @@
 import logging
 import os
-import plistlib
-import pprint
 
 import msgpack
 import pytest
+
 import salt.serializers.json as jsonserializer
 import salt.serializers.msgpack as msgpackserializer
-import salt.serializers.plist as plistserializer
-import salt.serializers.python as pythonserializer
 import salt.serializers.yaml as yamlserializer
 import salt.states.file as filestate
 import salt.utils.files
 import salt.utils.json
 import salt.utils.platform
+import salt.utils.secret
 import salt.utils.win_functions
 import salt.utils.yaml
 from salt.exceptions import CommandExecutionError
-from tests.support.mock import MagicMock, Mock, patch
+from tests.support.mock import MagicMock, Mock, mock_open, patch
 
 log = logging.getLogger(__name__)
 
@@ -31,9 +29,7 @@ def configure_loader_modules():
             "__serializers__": {
                 "yaml.serialize": yamlserializer.serialize,
                 "yaml.seserialize": yamlserializer.serialize,
-                "python.serialize": pythonserializer.serialize,
                 "json.serialize": jsonserializer.serialize,
-                "plist.serialize": plistserializer.serialize,
                 "msgpack.serialize": msgpackserializer.serialize,
             },
             "__opts__": {"test": False, "cachedir": ""},
@@ -74,18 +70,6 @@ def test_serialize():
         assert salt.utils.json.loads(returner.returned) == dataset
         filestate.serialize("/tmp", dataset, formatter="json")
         assert salt.utils.json.loads(returner.returned) == dataset
-
-        # plist
-        filestate.serialize("/tmp", dataset, serializer="plist")
-        assert plistlib.loads(returner.returned) == dataset
-        filestate.serialize("/tmp", dataset, formatter="plist")
-        assert plistlib.loads(returner.returned) == dataset
-
-        # Python
-        filestate.serialize("/tmp", dataset, serializer="python")
-        assert returner.returned == pprint.pformat(dataset) + "\n"
-        filestate.serialize("/tmp", dataset, formatter="python")
-        assert returner.returned == pprint.pformat(dataset) + "\n"
 
         # msgpack
         filestate.serialize("/tmp", dataset, serializer="msgpack")
@@ -130,7 +114,7 @@ def test_contents_and_contents_pillar():
 
 def test_contents_pillar_doesnt_add_more_newlines():
     # make sure the newline
-    pillar_value = "i am the pillar value{}".format(os.linesep)
+    pillar_value = f"i am the pillar value{os.linesep}"
 
     returner = MagicMock(return_value=None)
     path = "/tmp/foo"
@@ -181,12 +165,12 @@ def test_exists():
     assert filestate.exists("") == ret
 
     with patch.object(os.path, "exists", mock_f):
-        comt = "Specified path {} does not exist".format(name)
+        comt = f"Specified path {name} does not exist"
         ret.update({"comment": comt, "name": name})
         assert filestate.exists(name) == ret
 
     with patch.object(os.path, "exists", mock_t):
-        comt = "Path {} exists".format(name)
+        comt = f"Path {name} exists"
         ret.update({"comment": comt, "result": True})
         assert filestate.exists(name) == ret
 
@@ -208,12 +192,12 @@ def test_missing():
     assert filestate.missing("") == ret
 
     with patch.object(os.path, "exists", mock_t):
-        comt = "Specified path {} exists".format(name)
+        comt = f"Specified path {name} exists"
         ret.update({"comment": comt, "name": name})
         assert filestate.missing(name) == ret
 
     with patch.object(os.path, "exists", mock_f):
-        comt = "Path {} is missing".format(name)
+        comt = f"Path {name} is missing"
         ret.update({"comment": comt, "result": True})
         assert filestate.missing(name) == ret
 
@@ -270,38 +254,33 @@ def test_recurse():
         assert filestate.recurse(name, source, user=user, group=group) == ret
 
         with patch.object(os.path, "isabs", mock_f):
-            comt = "Specified file {} is not an absolute path".format(name)
+            comt = f"Specified file {name} is not an absolute path"
             ret.update({"comment": comt})
             assert filestate.recurse(name, source) == ret
 
         with patch.object(os.path, "isabs", mock_t):
-            comt = "Invalid source '1' (must be a salt:// URI)"
+            comt = "Recurse failed: Invalid source '1' (must be a salt:// URI)"
             ret.update({"comment": comt})
             assert filestate.recurse(name, 1) == ret
 
-            comt = "Invalid source '//code/flask' (must be a salt:// URI)"
+            comt = (
+                "Recurse failed: Invalid source '//code/flask' (must be a salt:// URI)"
+            )
             ret.update({"comment": comt})
             assert filestate.recurse(name, "//code/flask") == ret
 
-            comt = "Recurse failed: "
-            ret.update({"comment": comt})
-            assert filestate.recurse(name, source) == ret
-
-            comt = (
-                "The directory 'code/flask' does not exist"
-                " on the salt fileserver in saltenv 'base'"
-            )
+            comt = "Recurse failed: none of the specified sources were found"
             ret.update({"comment": comt})
             assert filestate.recurse(name, source) == ret
 
             with patch.object(os.path, "isdir", mock_f):
                 with patch.object(os.path, "exists", mock_t):
-                    comt = "The path {} exists and is not a directory".format(name)
+                    comt = f"The path {name} exists and is not a directory"
                     ret.update({"comment": comt})
                     assert filestate.recurse(name, source) == ret
 
             with patch.object(os.path, "isdir", mock_t):
-                comt = "The directory {} is in the correct state".format(name)
+                comt = f"The directory {name} is in the correct state"
                 ret.update({"comment": comt, "result": True})
                 assert filestate.recurse(name, source) == ret
 
@@ -324,7 +303,7 @@ def test_replace():
     mock_t = MagicMock(return_value=True)
     mock_f = MagicMock(return_value=False)
     with patch.object(os.path, "isabs", mock_f):
-        comt = "Specified file {} is not an absolute path".format(name)
+        comt = f"Specified file {name} is not an absolute path"
         ret.update({"comment": comt, "name": name})
         assert filestate.replace(name, pattern, repl) == ret
 
@@ -355,7 +334,7 @@ def test_blockreplace():
         mock_t = MagicMock(return_value=True)
         mock_f = MagicMock(return_value=False)
         with patch.object(os.path, "isabs", mock_f):
-            comt = "Specified file {} is not an absolute path".format(name)
+            comt = f"Specified file {name} is not an absolute path"
             ret.update({"comment": comt, "name": name})
             assert filestate.blockreplace(name) == ret
 
@@ -388,26 +367,26 @@ def test_touch():
     mock_t = MagicMock(return_value=True)
     mock_f = MagicMock(return_value=False)
     with patch.object(os.path, "isabs", mock_f):
-        comt = "Specified file {} is not an absolute path".format(name)
+        comt = f"Specified file {name} is not an absolute path"
         ret.update({"comment": comt, "name": name})
         assert filestate.touch(name) == ret
 
     with patch.object(os.path, "isabs", mock_t):
         with patch.object(os.path, "exists", mock_f):
             with patch.dict(filestate.__opts__, {"test": True}):
-                comt = "File {} is set to be created".format(name)
+                comt = f"File {name} is set to be created"
                 ret.update({"comment": comt, "result": None, "changes": {"new": name}})
                 assert filestate.touch(name) == ret
 
         with patch.dict(filestate.__opts__, {"test": False}):
             with patch.object(os.path, "isdir", mock_f):
-                comt = "Directory not present to touch file {}".format(name)
+                comt = f"Directory not present to touch file {name}"
                 ret.update({"comment": comt, "result": False, "changes": {}})
                 assert filestate.touch(name) == ret
 
             with patch.object(os.path, "isdir", mock_t):
                 with patch.dict(filestate.__salt__, {"file.touch": mock_t}):
-                    comt = "Created empty file {}".format(name)
+                    comt = f"Created empty file {name}"
                     ret.update(
                         {"comment": comt, "result": True, "changes": {"new": name}}
                     )
@@ -481,7 +460,7 @@ def test_serialize_into_managed_file():
     mock_t = MagicMock(return_value=True)
     mock_f = MagicMock(return_value=False)
     with patch.object(os.path, "isfile", mock_f):
-        comt = "File {} is not present and is not set for creation".format(name)
+        comt = f"File {name} is not present and is not set for creation"
         ret.update({"comment": comt, "name": name, "result": True})
         assert filestate.serialize(name, create=False) == ret
 
@@ -494,11 +473,11 @@ def test_serialize_into_managed_file():
     assert filestate.serialize(name) == ret
 
     with patch.object(os.path, "isfile", mock_t):
-        comt = "merge_if_exists is not supported for the python serializer"
+        comt = "merge_if_exists is not supported for the json serializer"
         ret.update({"comment": comt, "result": False})
         assert (
             filestate.serialize(
-                name, dataset=True, merge_if_exists=True, formatter="python"
+                name, dataset=True, merge_if_exists=True, formatter="json"
             )
             == ret
         )
@@ -515,25 +494,45 @@ def test_serialize_into_managed_file():
     # __opts__['test']=True with changes
     with patch.dict(filestate.__salt__, {"file.check_managed_changes": mock_changes}):
         with patch.dict(filestate.__opts__, {"test": True}):
-            comt = "Dataset will be serialized and stored into {}".format(name)
+            comt = f"Dataset will be serialized and stored into {name}"
             ret.update({"comment": comt, "result": None, "changes": True})
-            assert filestate.serialize(name, dataset=True, formatter="python") == ret
+            assert filestate.serialize(name, dataset=True, formatter="json") == ret
 
     # __opts__['test']=True without changes
     with patch.dict(
         filestate.__salt__, {"file.check_managed_changes": mock_no_changes}
     ):
         with patch.dict(filestate.__opts__, {"test": True}):
-            comt = "The file {} is in the correct state".format(name)
+            comt = f"The file {name} is in the correct state"
             ret.update({"comment": comt, "result": True, "changes": False})
-            assert filestate.serialize(name, dataset=True, formatter="python") == ret
+            assert filestate.serialize(name, dataset=True, formatter="json") == ret
 
     mock = MagicMock(return_value=ret)
     with patch.dict(filestate.__opts__, {"test": False}):
         with patch.dict(filestate.__salt__, {"file.manage_file": mock}):
-            comt = "Dataset will be serialized and stored into {}".format(name)
+            comt = f"Dataset will be serialized and stored into {name}"
             ret.update({"comment": comt, "result": None})
-            assert filestate.serialize(name, dataset=True, formatter="python") == ret
+            assert filestate.serialize(name, dataset=True, formatter="json") == ret
+
+    # merge_if_exists deserialization error
+    mock_exception = MagicMock(side_effect=TypeError("test"))
+    with patch.object(os.path, "isfile", mock_t):
+        with patch.dict(
+            filestate.__serializers__,
+            {
+                "exception.serialize": mock_exception,
+                "exception.deserialize": mock_exception,
+            },
+        ):
+            with patch.object(salt.utils.files, "fopen", mock_open(read_data="foo")):
+                comt = "Failed to deserialize existing data: test"
+                ret.update({"comment": comt, "result": False, "changes": {}})
+                assert (
+                    filestate.serialize(
+                        name, dataset=True, merge_if_exists=True, serializer="exception"
+                    )
+                    == ret
+                )
 
 
 # 'mknod' function tests: 1
@@ -577,3 +576,113 @@ def test_mod_run_check_cmd():
         assert filestate.mod_run_check_cmd(cmd, filename) == ret
 
         assert filestate.mod_run_check_cmd(cmd, filename)
+
+
+def test_recurse_test_mode_user_group_not_present():
+    """
+    Test file recurse in test mode with no user or group existing
+    """
+    filename = "/tmp/recurse_no_user_group_test_mode"
+    source = "salt://tmp/src_recurse_no_user_group_test_mode"
+    mock_l = MagicMock(return_value=[])
+    mock_emt = MagicMock(return_value=["tmp/src_recurse_no_user_group_test_mode"])
+    with patch.dict(
+        filestate.__salt__,
+        {
+            "file.group_to_gid": MagicMock(side_effect=["1234", "", ""]),
+            "file.user_to_uid": MagicMock(side_effect=["", "4321", ""]),
+            "file.get_mode": MagicMock(return_value="0644"),
+            "file.source_list": MagicMock(return_value=[source, ""]),
+            "cp.list_master_dirs": mock_emt,
+            "cp.list_master": mock_l,
+        },
+    ), patch.dict(filestate.__opts__, {"test": True}), patch.object(
+        os.path, "exists", return_value=True
+    ), patch.object(
+        os.path, "isdir", return_value=True
+    ):
+        ret = filestate.recurse(
+            filename, source, group="nonexistinggroup", user="nonexistinguser"
+        )
+        assert ret["result"] is not False
+        assert "is not available" not in ret["comment"]
+
+        ret = filestate.recurse(
+            filename, source, group="nonexistinggroup", user="nonexistinguser"
+        )
+        assert ret["result"] is not False
+        assert "is not available" not in ret["comment"]
+
+        ret = filestate.recurse(
+            filename, source, group="nonexistinggroup", user="nonexistinguser"
+        )
+        assert ret["result"] is not False
+        assert "is not available" not in ret["comment"]
+
+
+def _masking_pillar_get(masked_pillar):
+    """A fake pillar.get that masks scalar strings unless unmask=True."""
+
+    def _get(key, default=None, unmask=None, **kwargs):
+        value = masked_pillar.get(key, default)
+        if value is default:
+            return default
+        if unmask:
+            return salt.utils.secret.expose(value)
+        return salt.utils.secret.serial(value)
+
+    return _get
+
+
+def test_decode_contents_pillar_unmasks_pillar_values(tmp_path):
+    """
+    Regression test for issue #69709: file.decode with contents_pillar must
+    request unmasked pillar values, otherwise the redaction placeholder is
+    decoded and written to the file instead of the real data.
+    """
+    secret = "c3VwZXItc2VjcmV0LWtleQ=="  # base64, a scalar string in pillar
+    masked_pillar = salt.utils.secret.hide({"encoded_blob": secret})
+    captured = {}
+
+    def fake_decodefile(content, name, *args, **kwargs):
+        captured["content"] = content
+        return True
+
+    with patch.dict(
+        filestate.__salt__,
+        {
+            "pillar.get": _masking_pillar_get(masked_pillar),
+            "file.file_exists": MagicMock(return_value=False),
+            "hashutil.base64_decodefile": fake_decodefile,
+            "hashutil.digest_file": MagicMock(return_value="deadbeef"),
+        },
+    ):
+        filestate.decode(str(tmp_path / "out.bin"), contents_pillar="encoded_blob")
+
+    assert captured["content"] == secret
+    assert captured["content"] != salt.utils.secret.REDACT_PLACEHOLDER
+
+
+def test_decode_contents_pillar_missing_key_still_errors_69709(tmp_path):
+    """
+    Guard against overcorrection of the issue #69709 fix: file.decode passes
+    False as the positional default to pillar.get (now alongside unmask=True),
+    and a missing pillar key must still return that default untouched so the
+    'Pillar data not found.' error is raised instead of writing anything to
+    disk. This test passes both with and without the fix applied.
+    """
+    masked_pillar = salt.utils.secret.hide({})  # pillar key does not exist
+    decodefile = MagicMock()
+
+    with patch.dict(
+        filestate.__salt__,
+        {
+            "pillar.get": _masking_pillar_get(masked_pillar),
+            "file.file_exists": MagicMock(return_value=False),
+            "hashutil.base64_decodefile": decodefile,
+        },
+    ):
+        with pytest.raises(CommandExecutionError, match="Pillar data not found."):
+            filestate.decode(str(tmp_path / "out.bin"), contents_pillar="missing_blob")
+
+    decodefile.assert_not_called()

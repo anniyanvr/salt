@@ -2,14 +2,15 @@
 Custom YAML loading in Salt
 """
 
-
+import base64
+import binascii
 import re
-import warnings
 
-import salt.utils.stringutils
 import yaml  # pylint: disable=blacklisted-import
 from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode, SequenceNode
+
+import salt.utils.stringutils
 
 try:
     yaml.Loader = yaml.CLoader
@@ -19,15 +20,6 @@ except Exception:  # pylint: disable=broad-except
 
 
 __all__ = ["SaltYamlSafeLoader", "load", "safe_load"]
-
-
-class DuplicateKeyWarning(RuntimeWarning):
-    """
-    Warned when duplicate keys exist
-    """
-
-
-warnings.simplefilter("always", category=DuplicateKeyWarning)
 
 
 # with code integrated from https://gist.github.com/844388
@@ -51,6 +43,9 @@ class SaltYamlSafeLoader(yaml.SafeLoader):
             "tag:yaml.org,2002:python/unicode", type(self).construct_unicode
         )
         self.add_constructor("tag:yaml.org,2002:timestamp", type(self).construct_scalar)
+        self.add_constructor(
+            "tag:yaml.org,2002:binary", type(self).construct_yaml_binary
+        )
         self.dictclass = dictclass
 
     def construct_yaml_map(self, node):
@@ -70,7 +65,7 @@ class SaltYamlSafeLoader(yaml.SafeLoader):
             raise ConstructorError(
                 None,
                 None,
-                "expected a mapping node, but found {}".format(node.id),
+                f"expected a mapping node, but found {node.id}",
                 node.start_mark,
             )
 
@@ -86,7 +81,7 @@ class SaltYamlSafeLoader(yaml.SafeLoader):
                 raise ConstructorError(
                     context,
                     node.start_mark,
-                    "found unacceptable key {}".format(key_node.value),
+                    f"found unacceptable key {key_node.value}",
                     key_node.start_mark,
                 )
             value = self.construct_object(value_node, deep=deep)
@@ -94,7 +89,7 @@ class SaltYamlSafeLoader(yaml.SafeLoader):
                 raise ConstructorError(
                     context,
                     node.start_mark,
-                    "found conflicting ID '{}'".format(key),
+                    f"found conflicting ID '{key}'",
                     key_node.start_mark,
                 )
             mapping[key] = value
@@ -124,6 +119,30 @@ class SaltYamlSafeLoader(yaml.SafeLoader):
     def construct_yaml_str(self, node):
         value = self.construct_scalar(node)
         return salt.utils.stringutils.to_unicode(value)
+
+    def construct_yaml_binary(self, node):
+        try:
+            value = self.construct_scalar(node).encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ConstructorError(
+                None,
+                None,
+                f"failed to convert base64 data into ascii: {exc}",
+                node.start_mark,
+            )
+        try:
+            # Add padding if needed to tolerate unpadded base64 (e.g. !!binary a1b2c3)
+            missing = len(value) % 4
+            if missing:
+                value += b"=" * (4 - missing)
+            return base64.decodebytes(value)
+        except binascii.Error as exc:
+            raise ConstructorError(
+                None,
+                None,
+                f"failed to decode base64 data: {exc}",
+                node.start_mark,
+            )
 
     def fetch_plain(self):
         """

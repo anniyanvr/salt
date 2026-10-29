@@ -2,8 +2,8 @@
     :codeauthor: Bo Maryniuk <bo@suse.de>
 """
 
-
 import configparser
+import errno
 import io
 import os
 from xml.dom import minidom
@@ -14,7 +14,7 @@ import salt.utils.files
 import salt.utils.pkg
 from salt.exceptions import CommandExecutionError
 from tests.support.mixins import LoaderModuleMockMixin
-from tests.support.mock import MagicMock, Mock, call, patch
+from tests.support.mock import MagicMock, Mock, call, mock_open, patch
 from tests.support.unit import TestCase
 
 
@@ -70,6 +70,7 @@ class ZypperTestCase(TestCase, LoaderModuleMockMixin):
                     "enabled": False,
                     "baseurl": self.new_repo_config["url"],
                     "alias": self.new_repo_config["name"],
+                    "name": self.new_repo_config["name"],
                     "priority": 1,
                     "type": "rpm-md",
                 }
@@ -94,7 +95,7 @@ class ZypperTestCase(TestCase, LoaderModuleMockMixin):
         }
         with patch.dict(
             zypper.__salt__, {"cmd.run_all": MagicMock(return_value=ref_out)}
-        ):
+        ), patch.object(zypper.__zypper__, "_is_rpm_lock", return_value=False):
             upgrades = zypper.list_upgrades(refresh=False)
             self.assertEqual(len(upgrades), 3)
             for pkg, version in {
@@ -194,17 +195,34 @@ class ZypperTestCase(TestCase, LoaderModuleMockMixin):
             ' type="error">Booya!</message></stream>'
         )
         sniffer = RunSniffer(stdout=stdout_xml_snippet, retcode=1)
-        with patch.dict("salt.modules.zypperpkg.__salt__", {"cmd.run_all": sniffer}):
+        with patch.dict(
+            "salt.modules.zypperpkg.__salt__", {"cmd.run_all": sniffer}
+        ), patch.object(zypper.__zypper__, "_is_rpm_lock", return_value=False):
             with self.assertRaisesRegex(
                 CommandExecutionError, "^Zypper command failure: Booya!$"
             ):
                 zypper.__zypper__.xml.call("crashme")
 
+        output_to_user_stdout = "Output to user to stdout"
+        output_to_user_stderr = "Output to user to stderr"
+        sniffer = RunSniffer(
+            stdout=output_to_user_stdout, stderr=output_to_user_stderr, retcode=1
+        )
+        with patch.dict(
+            "salt.modules.zypperpkg.__salt__", {"cmd.run_all": sniffer}
+        ), patch.object(zypper.__zypper__, "_is_rpm_lock", return_value=False):
             with self.assertRaisesRegex(
-                CommandExecutionError, "^Zypper command failure: Check Zypper's logs.$"
+                CommandExecutionError,
+                "^Zypper command failure: {}$".format(
+                    output_to_user_stderr + output_to_user_stdout
+                ),
             ):
                 zypper.__zypper__.call("crashme again")
 
+        sniffer = RunSniffer(retcode=1)
+        with patch.dict(
+            "salt.modules.zypperpkg.__salt__", {"cmd.run_all": sniffer}
+        ), patch.object(zypper.__zypper__, "_is_rpm_lock", return_value=False):
             zypper.__zypper__.noraise.call("stay quiet")
             self.assertEqual(zypper.__zypper__.error_msg, "Check Zypper's logs.")
 
@@ -228,7 +246,7 @@ class ZypperTestCase(TestCase, LoaderModuleMockMixin):
         with patch.dict(
             "salt.modules.zypperpkg.__salt__",
             {"cmd.run_all": MagicMock(return_value=ref_out)},
-        ):
+        ), patch.object(zypper.__zypper__, "_is_rpm_lock", return_value=False):
             with self.assertRaisesRegex(
                 CommandExecutionError,
                 "^Zypper command failure: Some handled zypper internal error{}Another"
@@ -241,7 +259,7 @@ class ZypperTestCase(TestCase, LoaderModuleMockMixin):
         with patch.dict(
             "salt.modules.zypperpkg.__salt__",
             {"cmd.run_all": MagicMock(return_value=ref_out)},
-        ):
+        ), patch.object(zypper.__zypper__, "_is_rpm_lock", return_value=False):
             with self.assertRaisesRegex(
                 CommandExecutionError, "^Zypper command failure: Check Zypper's logs.$"
             ):
@@ -354,7 +372,12 @@ class ZypperTestCase(TestCase, LoaderModuleMockMixin):
         run_out = {"stderr": "", "stdout": "\n".join(ref_out), "retcode": 0}
 
         zypper_mock = MagicMock(return_value=run_out)
-        call_kwargs = {"output_loglevel": "trace", "python_shell": False, "env": {}}
+        call_kwargs = {
+            "output_loglevel": "trace",
+            "python_shell": False,
+            "env": {},
+            "success_retcodes": [0, 6],
+        }
         with patch.dict(zypper.__salt__, {"cmd.run_all": zypper_mock}):
             with patch.object(salt.utils.pkg, "clear_rtag", Mock()):
                 result = zypper.refresh_db()
@@ -371,6 +394,73 @@ class ZypperTestCase(TestCase, LoaderModuleMockMixin):
                 zypper.refresh_db(force=True)
                 zypper_mock.assert_called_with(
                     ["zypper", "--non-interactive", "refresh", "--force"], **call_kwargs
+                )
+                zypper.refresh_db(gpgautoimport=True)
+                zypper_mock.assert_called_with(
+                    [
+                        "zypper",
+                        "--non-interactive",
+                        "--gpg-auto-import-keys",
+                        "refresh",
+                        "--force",
+                    ],
+                    **call_kwargs,
+                )
+                zypper.refresh_db(gpgautoimport=True, force=True)
+                zypper_mock.assert_called_with(
+                    [
+                        "zypper",
+                        "--non-interactive",
+                        "--gpg-auto-import-keys",
+                        "refresh",
+                        "--force",
+                    ],
+                    **call_kwargs,
+                )
+                zypper.refresh_db(gpgautoimport=True, force=False)
+                zypper_mock.assert_called_with(
+                    [
+                        "zypper",
+                        "--non-interactive",
+                        "--gpg-auto-import-keys",
+                        "refresh",
+                    ],
+                    **call_kwargs,
+                )
+                zypper.refresh_db(
+                    gpgautoimport=True,
+                    refresh=True,
+                    repos="mock-repo-name",
+                    root=None,
+                    url="http://repo.url/some/path",
+                )
+                zypper_mock.assert_called_with(
+                    [
+                        "zypper",
+                        "--non-interactive",
+                        "--gpg-auto-import-keys",
+                        "refresh",
+                        "--force",
+                        "mock-repo-name",
+                    ],
+                    **call_kwargs,
+                )
+                zypper.refresh_db(
+                    gpgautoimport=True,
+                    repos="mock-repo-name",
+                    root=None,
+                    url="http://repo.url/some/path",
+                )
+                zypper_mock.assert_called_with(
+                    [
+                        "zypper",
+                        "--non-interactive",
+                        "--gpg-auto-import-keys",
+                        "refresh",
+                        "--force",
+                        "mock-repo-name",
+                    ],
+                    **call_kwargs,
                 )
 
     def test_info_installed(self):
@@ -606,144 +696,6 @@ class ZypperTestCase(TestCase, LoaderModuleMockMixin):
                 {"vim": "7.4.326-2.62", "fakepkg": ""},
             )
 
-    def test_upgrade_success(self):
-        """
-        Test system upgrade and dist-upgrade success.
-
-        :return:
-        """
-        with patch.dict(zypper.__grains__, {"osrelease_info": [12, 1]}), patch(
-            "salt.modules.zypperpkg.refresh_db", MagicMock(return_value=True)
-        ), patch(
-            "salt.modules.zypperpkg._systemd_scope", MagicMock(return_value=False)
-        ):
-            with patch(
-                "salt.modules.zypperpkg.__zypper__.noraise.call", MagicMock()
-            ) as zypper_mock:
-                with patch(
-                    "salt.modules.zypperpkg.list_pkgs",
-                    MagicMock(side_effect=[{"vim": "1.1"}, {"vim": "1.2"}]),
-                ):
-                    ret = zypper.upgrade()
-                    self.assertDictEqual(ret, {"vim": {"old": "1.1", "new": "1.2"}})
-                    zypper_mock.assert_any_call("update", "--auto-agree-with-licenses")
-
-                with patch(
-                    "salt.modules.zypperpkg.list_pkgs",
-                    MagicMock(
-                        side_effect=[
-                            {"kernel-default": "1.1"},
-                            {"kernel-default": "1.1,1.2"},
-                        ]
-                    ),
-                ):
-                    ret = zypper.upgrade()
-                    self.assertDictEqual(
-                        ret, {"kernel-default": {"old": "1.1", "new": "1.1,1.2"}}
-                    )
-                    zypper_mock.assert_any_call("update", "--auto-agree-with-licenses")
-
-                with patch(
-                    "salt.modules.zypperpkg.list_pkgs",
-                    MagicMock(side_effect=[{"vim": "1.1"}, {"vim": "1.1,1.2"}]),
-                ):
-                    ret = zypper.upgrade()
-                    self.assertDictEqual(ret, {"vim": {"old": "1.1", "new": "1.1,1.2"}})
-                    zypper_mock.assert_any_call("update", "--auto-agree-with-licenses")
-
-                with patch(
-                    "salt.modules.zypperpkg.list_pkgs",
-                    MagicMock(side_effect=[{"vim": "1.1"}, {"vim": "1.2"}]),
-                ):
-                    ret = zypper.upgrade(dist_upgrade=True)
-                    self.assertDictEqual(ret, {"vim": {"old": "1.1", "new": "1.2"}})
-                    zypper_mock.assert_any_call(
-                        "dist-upgrade", "--auto-agree-with-licenses"
-                    )
-
-                with patch(
-                    "salt.modules.zypperpkg.list_pkgs",
-                    MagicMock(side_effect=[{"vim": "1.1"}, {"vim": "1.1"}]),
-                ):
-                    ret = zypper.upgrade(dist_upgrade=True, dryrun=True)
-                    zypper_mock.assert_any_call(
-                        "dist-upgrade", "--auto-agree-with-licenses", "--dry-run"
-                    )
-                    zypper_mock.assert_any_call(
-                        "dist-upgrade",
-                        "--auto-agree-with-licenses",
-                        "--dry-run",
-                        "--debug-solver",
-                    )
-
-                with patch(
-                    "salt.modules.zypperpkg.list_pkgs",
-                    MagicMock(side_effect=[{"vim": "1.1"}, {"vim": "1.1"}]),
-                ):
-                    ret = zypper.upgrade(
-                        dist_upgrade=True,
-                        dryrun=True,
-                        fromrepo=["Dummy", "Dummy2"],
-                        novendorchange=True,
-                    )
-                    zypper_mock.assert_any_call(
-                        "dist-upgrade",
-                        "--auto-agree-with-licenses",
-                        "--dry-run",
-                        "--from",
-                        "Dummy",
-                        "--from",
-                        "Dummy2",
-                        "--no-allow-vendor-change",
-                    )
-                    zypper_mock.assert_any_call(
-                        "dist-upgrade",
-                        "--auto-agree-with-licenses",
-                        "--dry-run",
-                        "--from",
-                        "Dummy",
-                        "--from",
-                        "Dummy2",
-                        "--no-allow-vendor-change",
-                        "--debug-solver",
-                    )
-
-                with patch(
-                    "salt.modules.zypperpkg.list_pkgs",
-                    MagicMock(side_effect=[{"vim": "1.1"}, {"vim": "1.1"}]),
-                ):
-                    ret = zypper.upgrade(
-                        dist_upgrade=False, fromrepo=["Dummy", "Dummy2"], dryrun=False
-                    )
-                    zypper_mock.assert_any_call(
-                        "update",
-                        "--auto-agree-with-licenses",
-                        "--repo",
-                        "Dummy",
-                        "--repo",
-                        "Dummy2",
-                    )
-
-                with patch(
-                    "salt.modules.zypperpkg.list_pkgs",
-                    MagicMock(side_effect=[{"vim": "1.1"}, {"vim": "1.2"}]),
-                ):
-                    ret = zypper.upgrade(
-                        dist_upgrade=True,
-                        fromrepo=["Dummy", "Dummy2"],
-                        novendorchange=True,
-                    )
-                    self.assertDictEqual(ret, {"vim": {"old": "1.1", "new": "1.2"}})
-                    zypper_mock.assert_any_call(
-                        "dist-upgrade",
-                        "--auto-agree-with-licenses",
-                        "--from",
-                        "Dummy",
-                        "--from",
-                        "Dummy2",
-                        "--no-allow-vendor-change",
-                    )
-
     def test_upgrade_kernel(self):
         """
         Test kernel package upgrade success.
@@ -787,52 +739,6 @@ class ZypperTestCase(TestCase, LoaderModuleMockMixin):
                                 }
                             },
                         )
-
-    def test_upgrade_failure(self):
-        """
-        Test system upgrade failure.
-
-        :return:
-        """
-        zypper_out = """
-Loading repository data...
-Reading installed packages...
-Computing distribution upgrade...
-Use 'zypper repos' to get the list of defined repositories.
-Repository 'DUMMY' not found by its alias, number, or URI.
-"""
-
-        class FailingZypperDummy:
-            def __init__(self):
-                self.stdout = zypper_out
-                self.stderr = ""
-                self.pid = 1234
-                self.exit_code = 555
-                self.noraise = MagicMock()
-                self.SUCCESS_EXIT_CODES = [0]
-
-            def __call__(self, *args, **kwargs):
-                return self
-
-        with patch.dict(zypper.__grains__, {"osrelease_info": [12, 1]}), patch(
-            "salt.modules.zypperpkg.__zypper__", FailingZypperDummy()
-        ) as zypper_mock, patch(
-            "salt.modules.zypperpkg.refresh_db", MagicMock(return_value=True)
-        ), patch(
-            "salt.modules.zypperpkg._systemd_scope", MagicMock(return_value=False)
-        ):
-            zypper_mock.noraise.call = MagicMock()
-            with patch(
-                "salt.modules.zypperpkg.list_pkgs",
-                MagicMock(side_effect=[{"vim": "1.1"}, {"vim": "1.1"}]),
-            ):
-                with self.assertRaises(CommandExecutionError) as cmd_exc:
-                    ret = zypper.upgrade(dist_upgrade=True, fromrepo=["DUMMY"])
-                self.assertEqual(cmd_exc.exception.info["changes"], {})
-                self.assertEqual(cmd_exc.exception.info["result"]["stdout"], zypper_out)
-                zypper_mock.noraise.call.assert_called_with(
-                    "dist-upgrade", "--auto-agree-with-licenses", "--from", "DUMMY"
-                )
 
     def test_upgrade_available(self):
         """
@@ -1513,6 +1419,7 @@ Repository 'DUMMY' not found by its alias, number, or URI.
         # If config.get starts being used elsewhere, we'll need to write a
         # side_effect function.
         patches = {
+            "cmd.run": MagicMock(return_value="vim: vi vim\npico: pico"),
             "cmd.run_all": MagicMock(return_value=cmd_out),
             "pkg_resource.parse_targets": MagicMock(return_value=parsed_targets),
             "pkg_resource.stringify": MagicMock(),
@@ -1535,7 +1442,7 @@ Repository 'DUMMY' not found by its alias, number, or URI.
         """
         repos_cfg = configparser.ConfigParser()
         for cfg in ["zypper-repo-1.cfg", "zypper-repo-2.cfg"]:
-            repos_cfg.readfp(io.StringIO(get_test_data(cfg)))
+            repos_cfg.read_file(io.StringIO(get_test_data(cfg)))
 
         for alias in repos_cfg.sections():
             r_info = zypper._get_repo_info(alias, repos_cfg=repos_cfg)
@@ -1543,9 +1450,34 @@ Repository 'DUMMY' not found by its alias, number, or URI.
             self.assertEqual(type(r_info["enabled"]), bool)
             self.assertEqual(type(r_info["autorefresh"]), bool)
             self.assertEqual(type(r_info["baseurl"]), str)
+            self.assertEqual(type(r_info["name"]), str)
             self.assertEqual(r_info["type"], None)
             self.assertEqual(r_info["enabled"], alias == "SLE12-SP1-x86_64-Update")
             self.assertEqual(r_info["autorefresh"], alias == "SLE12-SP1-x86_64-Update")
+
+    def test_repo_add_mod_name(self):
+        """
+        Test mod_repo adds the new repo and call modify to update descriptive
+        name.
+
+        :return:
+        """
+        url = self.new_repo_config["url"]
+        name = self.new_repo_config["name"]
+        desc_name = "Update Repository"
+        zypper_patcher = patch.multiple(
+            "salt.modules.zypperpkg", **self.zypper_patcher_config
+        )
+
+        with zypper_patcher:
+            zypper.mod_repo(name, **{"url": url, "name": desc_name})
+            self.assertEqual(
+                zypper.__zypper__(root=None).xml.call.call_args_list,
+                [call("ar", url, name)],
+            )
+            zypper.__zypper__(root=None).refreshable.xml.call.assert_called_once_with(
+                "mr", "--name", desc_name, name
+            )
 
     def test_repo_add_nomod_noref(self):
         """
@@ -1617,6 +1549,7 @@ Repository 'DUMMY' not found by its alias, number, or URI.
             zypper.mod_repo(name, **params)
             expected_params = {
                 "alias": "mock-repo-name",
+                "name": "mock-repo-name",
                 "autorefresh": True,
                 "baseurl": "http://repo.url/some/path-changed",
                 "enabled": False,
@@ -1688,17 +1621,22 @@ Repository 'DUMMY' not found by its alias, number, or URI.
 
         url = self.new_repo_config["url"]
         name = self.new_repo_config["name"]
-        with zypper_patcher:
+        with zypper_patcher, patch.object(zypper, "refresh_db", Mock()) as refreshmock:
             zypper.mod_repo(name, **{"url": url, "gpgautoimport": True})
             self.assertEqual(
                 zypper.__zypper__(root=None).xml.call.call_args_list,
                 [
                     call("ar", url, name),
-                    call("--gpg-auto-import-keys", "refresh", name),
                 ],
             )
             self.assertTrue(
                 zypper.__zypper__(root=None).refreshable.xml.call.call_count == 0
+            )
+            refreshmock.assert_called_once_with(
+                gpgautoimport=True,
+                repos=name,
+                root=None,
+                url="http://repo.url/some/path",
             )
 
     def test_repo_noadd_nomod_ref(self):
@@ -1718,14 +1656,16 @@ Repository 'DUMMY' not found by its alias, number, or URI.
             "salt.modules.zypperpkg", **self.zypper_patcher_config
         )
 
-        with zypper_patcher:
+        with zypper_patcher, patch.object(zypper, "refresh_db", Mock()) as refreshmock:
             zypper.mod_repo(name, **{"url": url, "gpgautoimport": True})
-            self.assertEqual(
-                zypper.__zypper__(root=None).xml.call.call_args_list,
-                [call("--gpg-auto-import-keys", "refresh", name)],
-            )
             self.assertTrue(
                 zypper.__zypper__(root=None).refreshable.xml.call.call_count == 0
+            )
+            refreshmock.assert_called_once_with(
+                gpgautoimport=True,
+                repos=name,
+                root=None,
+                url="http://repo.url/some/path",
             )
 
     def test_repo_add_mod_ref(self):
@@ -1739,10 +1679,10 @@ Repository 'DUMMY' not found by its alias, number, or URI.
         zypper_patcher = patch.multiple(
             "salt.modules.zypperpkg", **self.zypper_patcher_config
         )
-
         url = self.new_repo_config["url"]
         name = self.new_repo_config["name"]
-        with zypper_patcher:
+
+        with zypper_patcher, patch.object(zypper, "refresh_db", Mock()) as refreshmock:
             zypper.mod_repo(
                 name, **{"url": url, "refresh": True, "gpgautoimport": True}
             )
@@ -1750,11 +1690,17 @@ Repository 'DUMMY' not found by its alias, number, or URI.
                 zypper.__zypper__(root=None).xml.call.call_args_list,
                 [
                     call("ar", url, name),
-                    call("--gpg-auto-import-keys", "refresh", name),
                 ],
             )
             zypper.__zypper__(root=None).refreshable.xml.call.assert_called_once_with(
-                "--gpg-auto-import-keys", "mr", "--refresh", name
+                "mr", "--refresh", name
+            )
+            refreshmock.assert_called_once_with(
+                gpgautoimport=True,
+                refresh=True,
+                repos=name,
+                root=None,
+                url="http://repo.url/some/path",
             )
 
     def test_repo_noadd_mod_ref(self):
@@ -1774,16 +1720,19 @@ Repository 'DUMMY' not found by its alias, number, or URI.
             "salt.modules.zypperpkg", **self.zypper_patcher_config
         )
 
-        with zypper_patcher:
+        with zypper_patcher, patch.object(zypper, "refresh_db", Mock()) as refreshmock:
             zypper.mod_repo(
                 name, **{"url": url, "refresh": True, "gpgautoimport": True}
             )
-            self.assertEqual(
-                zypper.__zypper__(root=None).xml.call.call_args_list,
-                [call("--gpg-auto-import-keys", "refresh", name)],
-            )
             zypper.__zypper__(root=None).refreshable.xml.call.assert_called_once_with(
-                "--gpg-auto-import-keys", "mr", "--refresh", name
+                "mr", "--refresh", name
+            )
+            refreshmock.assert_called_once_with(
+                gpgautoimport=True,
+                refresh=True,
+                repos=name,
+                root=None,
+                url="http://repo.url/some/path",
             )
 
     def test_wildcard_to_query_match_all(self):
@@ -1947,15 +1896,11 @@ Repository 'DUMMY' not found by its alias, number, or URI.
         _zpr.nolock.xml.call = MagicMock(return_value=minidom.parseString(xmldoc))
 
         for op in zypper.Wildcard.Z_OP:
-            assert zypper.Wildcard(_zpr)(
-                "libzypp", "{}*.1".format(op)
-            ) == "{}17.2.6-27.9.1".format(op)
+            assert zypper.Wildcard(_zpr)("libzypp", f"{op}*.1") == f"{op}17.2.6-27.9.1"
 
         # Auto-fix feature: moves operator from end to front
         for op in zypper.Wildcard.Z_OP:
-            assert zypper.Wildcard(_zpr)(
-                "libzypp", "16*{}".format(op)
-            ) == "{}16.2.5-25.1".format(op)
+            assert zypper.Wildcard(_zpr)("libzypp", f"16*{op}") == f"{op}16.2.5-25.1"
 
     def test_wildcard_to_query_unsupported_operators(self):
         """
@@ -1974,7 +1919,7 @@ Repository 'DUMMY' not found by its alias, number, or URI.
         _zpr.nolock.xml.call = MagicMock(return_value=minidom.parseString(xmldoc))
         with self.assertRaises(CommandExecutionError):
             for op in [">>", "==", "<<", "+"]:
-                zypper.Wildcard(_zpr)("libzypp", "{}*.1".format(op))
+                zypper.Wildcard(_zpr)("libzypp", f"{op}*.1")
 
     @patch("salt.modules.zypperpkg._get_visible_patterns")
     def test__get_installed_patterns(self, get_visible_patterns):
@@ -2063,3 +2008,37 @@ pattern() = package-c"""
         with patch("salt.modules.zypperpkg.__zypper__", zypper_mock):
             assert zypper.services_need_restart() == expected
             zypper_mock(root=None).nolock.call.assert_called_with("ps", "-sss")
+
+    def test_is_rpm_lock_no_error(self):
+        with patch.object(os.path, "exists", return_value=True):
+            self.assertFalse(zypper.__zypper__._is_rpm_lock())
+
+    def test_rpm_lock_does_not_exist(self):
+        if salt.utils.files.is_fcntl_available():
+            zypper.__zypper__.exit_code = 1
+            with patch.object(
+                os.path, "exists", return_value=False
+            ) as mock_path_exists:
+                self.assertFalse(zypper.__zypper__._is_rpm_lock())
+                mock_path_exists.assert_called_with(zypper.__zypper__.RPM_LOCK)
+            zypper.__zypper__._reset()
+
+    def test_rpm_lock_acquirable(self):
+        if salt.utils.files.is_fcntl_available():
+            zypper.__zypper__.exit_code = 1
+            with patch.object(os.path, "exists", return_value=True), patch(
+                "fcntl.lockf", side_effect=OSError(errno.EAGAIN, "")
+            ) as lockf_mock, patch("salt.utils.files.fopen", mock_open()):
+                self.assertTrue(zypper.__zypper__._is_rpm_lock())
+                lockf_mock.assert_called()
+            zypper.__zypper__._reset()
+
+    def test_rpm_lock_not_acquirable(self):
+        if salt.utils.files.is_fcntl_available():
+            zypper.__zypper__.exit_code = 1
+            with patch.object(os.path, "exists", return_value=True), patch(
+                "fcntl.lockf"
+            ) as lockf_mock, patch("salt.utils.files.fopen", mock_open()):
+                self.assertFalse(zypper.__zypper__._is_rpm_lock())
+                self.assertEqual(lockf_mock.call_count, 2)
+            zypper.__zypper__._reset()

@@ -78,7 +78,7 @@ class SystemdTestCase(TestCase):
         """
         with patch("subprocess.Popen") as popen_mock:
             _version = 231
-            output = "systemd {}\n-SYSVINIT".format(_version)
+            output = f"systemd {_version}\n-SYSVINIT"
             popen_mock.return_value = Mock(
                 communicate=lambda *args, **kwargs: (output, None),
                 pid=lambda: 12345,
@@ -162,7 +162,7 @@ class SystemdTestCase(TestCase):
         with patch("subprocess.Popen") as popen_mock:
             _expected = False
             _version = 204
-            _output = "systemd {}\n-SYSVINIT".format(_version)
+            _output = f"systemd {_version}\n-SYSVINIT"
             popen_mock.return_value = Mock(
                 communicate=lambda *args, **kwargs: (_output, None),
                 pid=lambda: 12345,
@@ -173,18 +173,20 @@ class SystemdTestCase(TestCase):
             # return data, so it is sufficient enough to mock it as True for
             # these tests.
             with patch("os.stat", side_effect=_booted_effect):
-                # Test without context dict passed
-                self.assertEqual(_systemd.has_scope(), _expected)
-                # Test that context key is set when context dict is passed
-                context = {}
-                self.assertEqual(_systemd.has_scope(context), _expected)
-                self.assertEqual(
-                    context,
-                    {
-                        "salt.utils.systemd.booted": True,
-                        "salt.utils.systemd.version": _version,
-                    },
-                )
+                with patch("salt.utils.systemd.status", return_value=True):
+                    # Test without context dict passed
+                    self.assertEqual(_systemd.has_scope(), _expected)
+                    context = {"salt.utils.systemd.status": True}
+                    # Test that context key is set when context dict is passed
+                    self.assertEqual(_systemd.has_scope(context), _expected)
+                    self.assertEqual(
+                        context,
+                        {
+                            "salt.utils.systemd.booted": True,
+                            "salt.utils.systemd.status": True,
+                            "salt.utils.systemd.version": _version,
+                        },
+                    )
 
     def test_has_scope_systemd205(self):
         """
@@ -196,7 +198,7 @@ class SystemdTestCase(TestCase):
         with patch("subprocess.Popen") as popen_mock:
             _expected = True
             _version = 205
-            _output = "systemd {}\n-SYSVINIT".format(_version)
+            _output = f"systemd {_version}\n-SYSVINIT"
             popen_mock.return_value = Mock(
                 communicate=lambda *args, **kwargs: (_output, None),
                 pid=lambda: 12345,
@@ -207,18 +209,20 @@ class SystemdTestCase(TestCase):
             # return data, so it is sufficient enough to mock it as True for
             # these tests.
             with patch("os.stat", side_effect=_booted_effect):
-                # Test without context dict passed
-                self.assertEqual(_systemd.has_scope(), _expected)
-                # Test that context key is set when context dict is passed
-                context = {}
-                self.assertEqual(_systemd.has_scope(context), _expected)
-                self.assertEqual(
-                    context,
-                    {
-                        "salt.utils.systemd.booted": True,
-                        "salt.utils.systemd.version": _version,
-                    },
-                )
+                with patch("salt.utils.systemd.status", return_value=True):
+                    # Test without context dict passed
+                    self.assertEqual(_systemd.has_scope(), _expected)
+                    # Test that context key is set when context dict is passed
+                    context = {"salt.utils.systemd.status": True}
+                    self.assertEqual(_systemd.has_scope(context), _expected)
+                    self.assertEqual(
+                        context,
+                        {
+                            "salt.utils.systemd.booted": True,
+                            "salt.utils.systemd.version": _version,
+                            "salt.utils.systemd.status": True,
+                        },
+                    )
 
     def test_has_scope_systemd206(self):
         """
@@ -230,7 +234,7 @@ class SystemdTestCase(TestCase):
         with patch("subprocess.Popen") as popen_mock:
             _expected = True
             _version = 206
-            _output = "systemd {}\n-SYSVINIT".format(_version)
+            _output = f"systemd {_version}\n-SYSVINIT"
             popen_mock.return_value = Mock(
                 communicate=lambda *args, **kwargs: (_output, None),
                 pid=lambda: 12345,
@@ -241,18 +245,20 @@ class SystemdTestCase(TestCase):
             # return data, so it is sufficient enough to mock it as True for
             # these tests.
             with patch("os.stat", side_effect=_booted_effect):
-                # Test without context dict passed
-                self.assertEqual(_systemd.has_scope(), _expected)
-                # Test that context key is set when context dict is passed
-                context = {}
-                self.assertEqual(_systemd.has_scope(context), _expected)
-                self.assertEqual(
-                    context,
-                    {
-                        "salt.utils.systemd.booted": True,
-                        "salt.utils.systemd.version": _version,
-                    },
-                )
+                with patch("salt.utils.systemd.status", return_value=True):
+                    # Test without context dict passed
+                    self.assertEqual(_systemd.has_scope(), _expected)
+                    # Test that context key is set when context dict is passed
+                    context = {"salt.utils.systemd.status": True}
+                    self.assertEqual(_systemd.has_scope(context), _expected)
+                    self.assertEqual(
+                        context,
+                        {
+                            "salt.utils.systemd.booted": True,
+                            "salt.utils.systemd.version": _version,
+                            "salt.utils.systemd.status": True,
+                        },
+                    )
 
     def test_has_scope_no_systemd(self):
         """
@@ -351,10 +357,53 @@ class SystemdTestCase(TestCase):
             Raised by DBUS, e.g. when a PID does not belong to a service
             """
 
-            ...
-
         dbus_mock = Mock()
         dbus_mock.DBusException = DBusException()
         dbus_mock.GetUnitByPID = Mock(site_effect=dbus_mock.DBusException)
         with patch("salt.utils.systemd.dbus", dbus_mock):
             assert _systemd.pid_to_service(99999) is None
+
+    def test_status_does_not_use_capture_output_kwarg(self):
+        """
+        Regression test for #68778.
+
+        salt-ssh's thin advertises Python 3.0+ as a supported target
+        interpreter (see ``salt/utils/thin.py`` ``py3:3:0``), which means
+        ``salt.utils.systemd`` must import and run on Python 3.6 targets
+        (e.g. stock RHEL 8 system Python). ``subprocess.run``'s
+        ``capture_output`` keyword was added in Python 3.7, so any call
+        site that passes it raises ``TypeError`` on 3.6.  Assert that
+        ``status()`` uses the equivalent ``stdout=PIPE, stderr=PIPE``
+        form instead of ``capture_output=True``.
+        """
+        run_mock = Mock(return_value=Mock(stderr=b""))
+        with patch("salt.utils.systemd.subprocess.run", run_mock):
+            _systemd.status({})
+        run_mock.assert_called_once()
+        _, kwargs = run_mock.call_args
+        assert "capture_output" not in kwargs, (
+            "salt.utils.systemd.status() must not use capture_output=; "
+            "it is Python 3.7+ only and salt-ssh targets can run 3.6."
+        )
+        assert kwargs.get("stdout") is subprocess.PIPE
+        assert kwargs.get("stderr") is subprocess.PIPE
+
+    @patch("salt.utils.systemd.dbus", False)
+    def test_pid_to_service_systemctl_does_not_use_capture_output_kwarg(self):
+        """
+        Regression test for #68778. See ``test_status_does_not_use_capture_output_kwarg``
+        for background — the same constraint applies to
+        ``_pid_to_service_systemctl``.
+        """
+        run_mock = Mock(return_value=Mock(stdout='{"_SYSTEMD_UNIT":"foo.service"}'))
+        with patch("salt.utils.systemd.subprocess.run", run_mock):
+            _systemd.pid_to_service(1234)
+        run_mock.assert_called_once()
+        _, kwargs = run_mock.call_args
+        assert "capture_output" not in kwargs, (
+            "salt.utils.systemd._pid_to_service_systemctl() must not use "
+            "capture_output=; it is Python 3.7+ only and salt-ssh targets "
+            "can run 3.6."
+        )
+        assert kwargs.get("stdout") is subprocess.PIPE
+        assert kwargs.get("stderr") is subprocess.PIPE

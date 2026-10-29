@@ -8,7 +8,6 @@
     Salt SSH related configuration schemas
 """
 
-
 from salt.config.schemas.minion import MinionConfiguration
 from salt.utils.schema import (
     AnyOfItem,
@@ -85,6 +84,15 @@ class RosterEntryConfig(Schema):
             "The target system's storage directory for Salt "
             "components. Defaults to /tmp/salt-<hash>."
         ),
+    )
+    relenv = BooleanItem(
+        title="Relenv",
+        description=(
+            "Deploy and use a relenv (Salt+Python bundled) environment on "
+            "the SSH target, equivalent to the --relenv CLI flag but scoped "
+            "to this roster entry."
+        ),
+        default=False,
     )
     minion_opts = DictItem(
         title="Minion Options",

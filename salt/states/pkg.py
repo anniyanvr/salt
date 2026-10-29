@@ -10,7 +10,7 @@ Installation of packages using OS package managers such as yum or apt-get
     Salt, when Salt updates itself (see ``KillMode`` in the `systemd.kill(5)`_
     manpage for more information). If desired, usage of `systemd-run(1)`_ can
     be suppressed by setting a :mod:`config option <salt.modules.config.get>`
-    called ``systemd.use_scope``, with a value of ``False`` (no quotes).
+    called ``systemd.scope``, with a value of ``False`` (no quotes).
 
 .. _`systemd-run(1)`: https://www.freedesktop.org/software/systemd/man/systemd-run.html
 .. _`systemd.kill(5)`: https://www.freedesktop.org/software/systemd/man/systemd.kill.html
@@ -64,71 +64,51 @@ state module
 
 .. warning::
 
-    Package names are currently case-sensitive. If the minion is using a
-    package manager which is not case-sensitive (such as :mod:`pkgng
-    <salt.modules.pkgng>`), then this state will fail if the proper case is not
-    used. This will be addressed in a future release of Salt.
+    Make sure the package name has the correct case for package managers which are
+    case-sensitive (such as :mod:`pkgng <salt.modules.pkgng>`).
 """
-
 
 import fnmatch
 import logging
 import os
 import re
+from collections import OrderedDict as _OrderedDict
 
+import salt.utils.args
 import salt.utils.pkg
 import salt.utils.platform
 import salt.utils.versions
 from salt.exceptions import CommandExecutionError, MinionError, SaltInvocationError
 from salt.modules.pkg_resource import _repack_pkgs
 from salt.output import nested
-from salt.utils.functools import namespaced_function as _namespaced_function
-from salt.utils.odict import OrderedDict as _OrderedDict
+from salt.utils.functools import namespaced_function
 
-# pylint: disable=invalid-name
-_repack_pkgs = _namespaced_function(_repack_pkgs, globals())
+_repack_pkgs = namespaced_function(_repack_pkgs, globals())
 
 if salt.utils.platform.is_windows():
-    # pylint: disable=import-error,no-name-in-module,unused-import
-    from urllib.parse import urlparse as _urlparse
-    from salt.exceptions import SaltRenderError
-    import collections
-    import datetime
-    import errno
-    import time
-    from functools import cmp_to_key
+    from salt.modules.win_pkg import (
+        _get_latest_pkg_version,
+        _get_package_info,
+        _get_repo_details,
+        _refresh_db_conditional,
+        _repo_process_pkg_sls,
+        _reverse_cmp_pkg_versions,
+        genrepo,
+        get_repo_data,
+        refresh_db,
+    )
 
-    # pylint: disable=import-error
-    # pylint: enable=unused-import
-    from salt.modules.win_pkg import _get_package_info
-    from salt.modules.win_pkg import get_repo_data
-    from salt.modules.win_pkg import _get_repo_details
-    from salt.modules.win_pkg import _refresh_db_conditional
-    from salt.modules.win_pkg import refresh_db
-    from salt.modules.win_pkg import genrepo
-    from salt.modules.win_pkg import _repo_process_pkg_sls
-    from salt.modules.win_pkg import _get_latest_pkg_version
-    from salt.modules.win_pkg import _reverse_cmp_pkg_versions
-
-    _get_package_info = _namespaced_function(_get_package_info, globals())
-    get_repo_data = _namespaced_function(get_repo_data, globals())
-    _get_repo_details = _namespaced_function(_get_repo_details, globals())
-    _refresh_db_conditional = _namespaced_function(_refresh_db_conditional, globals())
-    refresh_db = _namespaced_function(refresh_db, globals())
-    genrepo = _namespaced_function(genrepo, globals())
-    _repo_process_pkg_sls = _namespaced_function(_repo_process_pkg_sls, globals())
-    _get_latest_pkg_version = _namespaced_function(_get_latest_pkg_version, globals())
-    _reverse_cmp_pkg_versions = _namespaced_function(
+    _get_package_info = namespaced_function(_get_package_info, globals())
+    get_repo_data = namespaced_function(get_repo_data, globals())
+    _get_repo_details = namespaced_function(_get_repo_details, globals())
+    _refresh_db_conditional = namespaced_function(_refresh_db_conditional, globals())
+    refresh_db = namespaced_function(refresh_db, globals())
+    genrepo = namespaced_function(genrepo, globals())
+    _repo_process_pkg_sls = namespaced_function(_repo_process_pkg_sls, globals())
+    _get_latest_pkg_version = namespaced_function(_get_latest_pkg_version, globals())
+    _reverse_cmp_pkg_versions = namespaced_function(
         _reverse_cmp_pkg_versions, globals()
     )
-    # The following imports are used by the namespaced win_pkg funcs
-    # and need to be included in their globals.
-    # pylint: disable=import-error,unused-import
-    import salt.utils.msgpack as msgpack
-    from salt.utils.versions import LooseVersion
-
-    # pylint: enable=import-error,unused-import
-# pylint: enable=invalid-name
 
 log = logging.getLogger(__name__)
 
@@ -279,7 +259,7 @@ def _find_download_targets(
     normalize=True,
     skip_suggestions=False,
     ignore_epoch=None,
-    **kwargs
+    **kwargs,
 ):
     """
     Inspect the arguments to pkg.downloaded and discover what packages need to
@@ -330,7 +310,7 @@ def _find_download_targets(
                     "name": name,
                     "changes": {},
                     "result": True,
-                    "comment": "Package {} is already downloaded".format(name),
+                    "comment": f"Package {name} is already downloaded",
                 }
 
     version_spec = False
@@ -422,7 +402,7 @@ def _find_advisory_targets(name=None, advisory_ids=None, **kwargs):
                 "name": name,
                 "changes": {},
                 "result": True,
-                "comment": "Advisory patch {} is already installed".format(name),
+                "comment": f"Advisory patch {name} is already installed",
             }
 
     # Find out which advisory patches will be targeted in the call to pkg.install
@@ -534,7 +514,7 @@ def _find_install_targets(
     ignore_epoch=None,
     reinstall=False,
     refresh=False,
-    **kwargs
+    **kwargs,
 ):
     """
     Inspect the arguments to pkg.installed and discover what packages need to
@@ -603,7 +583,9 @@ def _find_install_targets(
     if any((pkgs, sources)):
         if pkgs:
             # pylint: disable=not-callable
-            desired = _repack_pkgs(pkgs, normalize=normalize)
+            desired = _repack_pkgs(
+                pkgs, normalize=normalize and kwargs.get("split_arch", True)
+            )
             # pylint: enable=not-callable
         elif sources:
             desired = __salt__["pkg_resource.pack_sources"](
@@ -633,7 +615,7 @@ def _find_install_targets(
                     "name": name,
                     "changes": {},
                     "result": False,
-                    "comment": "Package {} not found in the repository.".format(name),
+                    "comment": f"Package {name} not found in the repository.",
                 }
             if version is None:
                 # pylint: disable=not-callable
@@ -677,7 +659,7 @@ def _find_install_targets(
                     "name": name,
                     "changes": {},
                     "result": True,
-                    "comment": "Package {} is already installed".format(name),
+                    "comment": f"Package {name} is already installed",
                 }
 
     version_spec = False
@@ -763,7 +745,26 @@ def _find_install_targets(
     warnings = []
     failed_verify = False
     for package_name, version_string in desired.items():
-        cver = cur_pkgs.get(package_name, [])
+
+        # FreeBSD pkg supports `openjdk` and `java/openjdk7` package names
+        origin = bool(re.search("/", package_name))
+
+        if __grains__["os"] == "FreeBSD" and origin:
+            cver = [k for k, v in cur_pkgs.items() if v["origin"] == package_name]
+        else:
+            cver = cur_pkgs.get(package_name, [])
+            if not cver and "pkg.normalize_name" in __salt__:
+                # Providers such as yum/dnf strip a redundant architecture from
+                # package names (e.g. ``foo.x86_64`` -> ``foo``), so pkg.list_pkgs
+                # is keyed by the normalized name while an arch-qualified name from
+                # the SLS is not. Fall back to the normalized name so an already
+                # installed, arch-qualified package is not mistaken for a missing
+                # one. Multiarch names (e.g. ``foo:amd64`` on apt) normalize to
+                # themselves and are unaffected. See #69604.
+                normalized_name = __salt__["pkg.normalize_name"](package_name)
+                if normalized_name != package_name:
+                    cver = cur_pkgs.get(normalized_name, [])
+
         if resolve_capabilities and not cver and package_name in cur_prov:
             cver = cur_pkgs.get(cur_prov.get(package_name)[0], [])
 
@@ -782,7 +783,9 @@ def _find_install_targets(
             err = "Unable to cache {0}: {1}"
             try:
                 cached_path = __salt__["cp.cache_file"](
-                    version_string, saltenv=kwargs["saltenv"]
+                    version_string,
+                    saltenv=kwargs["saltenv"],
+                    verify_ssl=kwargs.get("verify_ssl", True),
                 )
             except CommandExecutionError as exc:
                 problems.append(err.format(version_string, exc))
@@ -791,13 +794,11 @@ def _find_install_targets(
                 problems.append(err.format(version_string, "file not found"))
                 continue
             elif not os.path.exists(cached_path):
-                problems.append("{} does not exist on minion".format(version_string))
+                problems.append(f"{version_string} does not exist on minion")
                 continue
             source_info = __salt__["lowpkg.bin_pkg_info"](cached_path)
             if source_info is None:
-                warnings.append(
-                    "Failed to parse metadata for {}".format(version_string)
-                )
+                warnings.append(f"Failed to parse metadata for {version_string}")
                 continue
             else:
                 verstr = source_info["version"]
@@ -819,7 +820,7 @@ def _find_install_targets(
                             package_name,
                             ignore_types=ignore_types,
                             verify_options=verify_options,
-                            **kwargs
+                            **kwargs,
                         )
                     except (CommandExecutionError, SaltInvocationError) as exc:
                         failed_verify = exc.strerror
@@ -853,7 +854,7 @@ def _find_install_targets(
                             package_name,
                             ignore_types=ignore_types,
                             verify_options=verify_options,
-                            **kwargs
+                            **kwargs,
                         )
                     except (CommandExecutionError, SaltInvocationError) as exc:
                         failed_verify = exc.strerror
@@ -924,12 +925,25 @@ def _verify_install(desired, new_pkgs, ignore_epoch=None, new_caps=None):
             cver = new_pkgs.get(pkgname, new_pkgs.get(pkgname.split("/")[-1]))
         elif __grains__["os"] == "OpenBSD":
             cver = new_pkgs.get(pkgname.split("%")[0])
-        elif __grains__["os_family"] == "Debian":
-            cver = new_pkgs.get(pkgname.split("=")[0])
         else:
-            cver = new_pkgs.get(pkgname)
-            if not cver and pkgname in new_caps:
-                cver = new_pkgs.get(new_caps.get(pkgname)[0])
+            lookup_name = pkgname.split("=")[0]
+            cver = new_pkgs.get(lookup_name)
+            if not cver and "pkg.normalize_name" in __salt__:
+                normalized_name = __salt__["pkg.normalize_name"](lookup_name)
+                if normalized_name != lookup_name:
+                    cver = new_pkgs.get(normalized_name)
+            if not cver and lookup_name in new_caps:
+                cver = new_pkgs.get(new_caps.get(lookup_name)[0])
+
+        # On FreeBSD with with_origin=True, a non-origin pkg lookup returns a
+        # dict {"origin": "...", "version": [...]} instead of a version list.
+        # Extract the version list so version-string comparison works correctly.
+        if (
+            __grains__["os"] == "FreeBSD"
+            and isinstance(cver, dict)
+            and "version" in cver
+        ):
+            cver = cver["version"]
 
         if not cver:
             failed.append(pkgname)
@@ -1011,6 +1025,61 @@ def _resolve_capabilities(pkgs, refresh=False, **kwargs):
     return ret, False
 
 
+def _get_installable_versions(targets, current=None):
+    """
+    .. versionadded:: 3007.0
+
+    Return a dictionary of changes that will be made to install a version of
+    each target package specified in the ``targets`` dictionary.  If ``current``
+    is specified, it should be a dictionary of package names to currently
+    installed versions. The function returns a dictionary of changes, where the
+    keys are the package names and the values are dictionaries with two keys:
+    "old" and "new". The value for "old" is the currently installed version (if
+    available) or an empty string, and the value for "new" is the latest
+    available version of the package or "installed".
+
+    :param targets: A dictionary where the keys are package names and the
+                    values indicate a specific version or ``None`` if the
+                    latest should be used.
+    :type targets: dict
+    :param current: A dictionary where the keys are package names and the
+                    values are currently installed versions.
+    :type current: dict or None
+    :return: A dictionary of changes to be made to install a version of
+             each package.
+    :rtype: dict
+    """
+    if current is None:
+        current = {}
+    changes = installable_versions = {}
+    latest_targets = [_get_desired_pkg(x, targets) for x, y in targets.items() if not y]
+    latest_versions = __salt__["pkg.latest_version"](*latest_targets)
+    if latest_targets:
+        # single pkg returns str
+        if isinstance(latest_versions, str):
+            installable_versions = {latest_targets[0]: latest_versions}
+        elif isinstance(latest_versions, dict):
+            installable_versions = latest_versions
+    explicit_targets = [
+        _get_desired_pkg(x, targets) for x in targets if x not in latest_targets
+    ]
+    if explicit_targets:
+        explicit_versions = __salt__["pkg.list_repo_pkgs"](*explicit_targets)
+        for tgt, ver_list in explicit_versions.items():
+            if ver_list:
+                installable_versions[tgt] = ver_list[0]
+    changes.update(
+        {
+            x: {
+                "new": installable_versions.get(x) or "installed",
+                "old": current.get(x, ""),
+            }
+            for x in targets
+        }
+    )
+    return changes
+
+
 def installed(
     name,
     version=None,
@@ -1026,9 +1095,11 @@ def installed(
     ignore_epoch=None,
     reinstall=False,
     update_holds=False,
-    **kwargs
+    **kwargs,
 ):
     """
+    .. versionchanged:: 3007.0
+
     Ensure that the package is installed, and that it is the correct version
     (if specified).
 
@@ -1053,6 +1124,12 @@ def installed(
         Any argument that is passed through to the ``install`` function, which
         is not defined for that function, will be silently ignored.
 
+    .. note::
+        In Windows, some packages are installed using the task manager. The Salt
+        minion installer does this. In that case, there is no way to know if the
+        package installs correctly. All that can be reported is that the task
+        that launches the installer started successfully.
+
     :param str name:
         The name of the package to be installed. This parameter is ignored if
         either "pkgs" or "sources" is used. Additionally, please note that this
@@ -1068,8 +1145,8 @@ def installed(
         :mod:`pacman <salt.modules.pacman>`,
         :mod:`pkgin <salt.modules.pkgin>`,
         :mod:`win_pkg <salt.modules.win_pkg>`,
-        :mod:`yumpkg <salt.modules.yumpkg>`, and
-        :mod:`zypper <salt.modules.zypper>`. The version number includes the
+        :mod:`yum <salt.modules.yumpkg>`, and
+        :mod:`zypper <salt.modules.zypperpkg>`. The version number includes the
         release designation where applicable, to allow Salt to target a
         specific release of a given version. When in doubt, using the
         ``pkg.latest_version`` function for an uninstalled package will tell
@@ -1301,14 +1378,15 @@ def installed(
 
         .. versionadded:: 2014.7.0
 
-        For requested packages that are already installed and would not be
-        targeted for upgrade or downgrade, use pkg.verify to determine if any
-        of the files installed by the package have been altered. If files have
-        been altered, the reinstall option of pkg.install is used to force a
-        reinstall. Types to ignore can be passed to pkg.verify. Additionally,
-        ``verify_options`` can be used to modify further the behavior of
-        pkg.verify. See examples below.  Currently, this option is supported
-        for the following pkg providers: :mod:`yumpkg <salt.modules.yumpkg>`.
+        Use pkg.verify to check if already installed packages require
+        reinstallion. Requested packages that are already installed and not
+        targeted for up- or downgrade are verified with pkg.verify to determine
+        if any file installed by the package have been modified or if package
+        dependencies are not fulfilled. ``ignore_types`` and ``verify_options``
+        can be passed to pkg.verify. See examples below. Currently, this option
+        is supported for the following pkg providers:
+        :mod:`yum <salt.modules.yumpkg>`,
+        :mod:`zypperpkg <salt.modules.zypperpkg>`.
 
         Examples:
 
@@ -1393,7 +1471,7 @@ def installed(
 
     |
 
-    **MULTIPLE PACKAGE INSTALLATION OPTIONS: (not supported in pkgng)**
+    **MULTIPLE PACKAGE INSTALLATION OPTIONS:**
 
     :param list pkgs:
         A list of packages to install from a software repository. All packages
@@ -1413,8 +1491,8 @@ def installed(
         :mod:`ebuild <salt.modules.ebuild>`,
         :mod:`pacman <salt.modules.pacman>`,
         :mod:`winrepo <salt.modules.win_pkg>`,
-        :mod:`yumpkg <salt.modules.yumpkg>`, and
-        :mod:`zypper <salt.modules.zypper>`,
+        :mod:`yum <salt.modules.yumpkg>`, and
+        :mod:`zypper <salt.modules.zypperpkg>`,
         version numbers can be specified
         in the ``pkgs`` argument. For example:
 
@@ -1428,7 +1506,7 @@ def installed(
                   - baz
 
         Additionally, :mod:`ebuild <salt.modules.ebuild>`, :mod:`pacman
-        <salt.modules.pacman>`, :mod:`zypper <salt.modules.zypper>`,
+        <salt.modules.pacman>`, :mod:`zypper <salt.modules.zypperpkg>`,
         :mod:`yum/dnf <salt.modules.yumpkg>`, and :mod:`apt
         <salt.modules.aptpkg>` support the ``<``, ``<=``, ``>=``, and ``>``
         operators for more control over what versions will be installed. For
@@ -1499,6 +1577,10 @@ def installed(
         can be updated. Otherwise, if this function attempts to update a held
         package, the held package(s) will be skipped and the state will fail.
         By default, this parameter is set to ``False``.
+
+        Package naming rules for held packages may vary by package manager.
+        See the documentation for your platform's ``pkg`` module for any
+        provider-specific requirements.
 
         Supported on YUM/DNF & APT based systems.
 
@@ -1731,7 +1813,8 @@ def installed(
         ignore_epoch=ignore_epoch,
         reinstall=reinstall,
         refresh=refresh,
-        **kwargs
+        split_arch=False,
+        **kwargs,
     )
 
     try:
@@ -1822,28 +1905,26 @@ def installed(
         )
 
     comment = []
-    changes = {"installed": {}}
+    changes = {}
     if __opts__["test"]:
         if targets:
             if sources:
-                _targets = targets
+                installable_versions = {
+                    x: {"new": "installed", "old": ""} for x in targets
+                }
             else:
-                _targets = [_get_desired_pkg(x, targets) for x in targets]
+                installable_versions = _get_installable_versions(targets)
+            changes.update(installable_versions)
             summary = ", ".join(targets)
-            changes["installed"].update(
-                {x: {"new": "installed", "old": ""} for x in targets}
-            )
             comment.append(
-                "The following packages would be installed/updated: {}".format(summary)
+                f"The following packages would be installed/updated: {summary}"
             )
         if to_unpurge:
             comment.append(
                 "The following packages would have their selection status "
                 "changed from 'purge' to 'install': {}".format(", ".join(to_unpurge))
             )
-            changes["installed"].update(
-                {x: {"new": "installed", "old": ""} for x in to_unpurge}
-            )
+            changes.update({x: {"new": "installed", "old": ""} for x in to_unpurge})
         if to_reinstall:
             # Add a comment for each package in to_reinstall with its
             # pkg.verify output
@@ -1856,7 +1937,7 @@ def installed(
                         reinstall_targets.append(
                             _get_desired_pkg(reinstall_pkg, to_reinstall)
                         )
-                    changes["installed"].update(
+                    changes.update(
                         {x: {"new": "installed", "old": ""} for x in reinstall_targets}
                     )
                 msg = "The following packages would be reinstalled: "
@@ -1872,7 +1953,7 @@ def installed(
                         "Package '{}' would be reinstalled because the "
                         "following files have been altered:".format(pkgstr)
                     )
-                    changes["installed"].update({reinstall_pkg: {}})
+                    changes.update({reinstall_pkg: {}})
                     comment.append(_nested_output(altered_files[reinstall_pkg]))
         ret = {
             "name": name,
@@ -1901,7 +1982,8 @@ def installed(
                 normalize=normalize,
                 update_holds=update_holds,
                 ignore_epoch=ignore_epoch,
-                **kwargs
+                split_arch=False,
+                **kwargs,
             )
         except CommandExecutionError as exc:
             ret = {"name": name, "result": False}
@@ -1911,10 +1993,10 @@ def installed(
                 ret["comment"] = exc.strerror_without_changes
             else:
                 ret["changes"] = {}
-                ret[
-                    "comment"
-                ] = "An error was encountered while installing package(s): {}".format(
-                    exc
+                ret["comment"] = (
+                    "An error was encountered while installing package(s): {}".format(
+                        exc
+                    )
                 )
             if warnings:
                 ret.setdefault("warnings", []).extend(warnings)
@@ -1924,7 +2006,7 @@ def installed(
             refresh = False
 
         if isinstance(pkg_ret, dict):
-            changes["installed"].update(pkg_ret)
+            changes.update(pkg_ret)
         elif isinstance(pkg_ret, str):
             comment.append(pkg_ret)
             # Code below will be looking for a dictionary. If this is a string
@@ -1981,7 +2063,7 @@ def installed(
 
     # Analyze pkg.install results for packages in targets
     if sources:
-        modified = [x for x in changes["installed"] if x in targets]
+        modified = [x for x in changes if x in targets]
         not_modified = [
             x for x in desired if x not in targets and x not in to_reinstall
         ]
@@ -1997,6 +2079,7 @@ def installed(
             new_caps = __salt__["pkg.list_provides"](**kwargs)
         else:
             new_caps = {}
+
         _ok, failed = _verify_install(
             desired, new_pkgs, ignore_epoch=ignore_epoch, new_caps=new_caps
         )
@@ -2004,10 +2087,17 @@ def installed(
         not_modified = [x for x in _ok if x not in targets and x not in to_reinstall]
         failed = [x for x in failed if x in targets]
 
-    # If there was nothing unpurged, just set the changes dict to the contents
-    # of changes['installed'].
-    if not changes.get("purge_desired"):
-        changes = changes["installed"]
+    # When installing packages that use the task scheduler, we can only know
+    # that the task was started, not that it installed successfully. This is
+    # especially the case when upgrading the Salt minion on Windows as the
+    # installer kills and unregisters the Salt minion service. We will only know
+    # that the installation was successful if the minion comes back up. So, we
+    # just want to report success in that scenario
+    for item in failed:
+        if item in changes and isinstance(changes[item], dict):
+            if changes[item].get("install status", "") == "task started":
+                modified.append(item)
+                failed.remove(item)
 
     if modified:
         if sources:
@@ -2015,9 +2105,7 @@ def installed(
         else:
             summary = ", ".join([_get_desired_pkg(x, desired) for x in modified])
         if len(summary) < 20:
-            comment.append(
-                "The following packages were installed/updated: {}".format(summary)
-            )
+            comment.append(f"The following packages were installed/updated: {summary}")
         else:
             comment.append(
                 "{} targeted package{} {} installed/updated.".format(
@@ -2050,9 +2138,7 @@ def installed(
         else:
             summary = ", ".join([_get_desired_pkg(x, desired) for x in not_modified])
         if len(not_modified) <= 20:
-            comment.append(
-                "The following packages were already installed: {}".format(summary)
-            )
+            comment.append(f"The following packages were already installed: {summary}")
         else:
             comment.append(
                 "{} targeted package{} {} already installed".format(
@@ -2073,9 +2159,7 @@ def installed(
             summary = ", ".join(failed)
         else:
             summary = ", ".join([_get_desired_pkg(x, desired) for x in failed])
-        comment.insert(
-            0, "The following packages failed to install/update: {}".format(summary)
-        )
+        comment.insert(0, f"The following packages failed to install/update: {summary}")
         result = False
 
     if failed_hold:
@@ -2123,7 +2207,7 @@ def installed(
                 reinstall_pkg,
                 ignore_types=ignore_types,
                 verify_options=verify_options,
-                **kwargs
+                **kwargs,
             )
             if verify_result:
                 failed.append(reinstall_pkg)
@@ -2138,7 +2222,7 @@ def installed(
                 pkgstr = modified_pkg
             else:
                 pkgstr = _get_desired_pkg(modified_pkg, desired)
-            msg = "Package {} was reinstalled.".format(pkgstr)
+            msg = f"Package {pkgstr} was reinstalled."
             if modified_pkg in altered_files:
                 msg += " The following files were remediated:"
                 comment.append(msg)
@@ -2153,7 +2237,7 @@ def installed(
                 pkgstr = failed_pkg
             else:
                 pkgstr = _get_desired_pkg(failed_pkg, desired)
-            msg = "Reinstall was not successful for package {}.".format(pkgstr)
+            msg = f"Reinstall was not successful for package {pkgstr}."
             if failed_pkg in altered_files:
                 msg += " The following files could not be remediated:"
                 comment.append(msg)
@@ -2204,7 +2288,7 @@ def downloaded(
         is not defined for that function, will be silently ignored.
 
     Currently supported for the following pkg providers:
-    :mod:`yumpkg <salt.modules.yumpkg>`, :mod:`zypper <salt.modules.zypper>` and :mod:`zypper <salt.modules.aptpkg>`
+    :mod:`yum <salt.modules.yumpkg>`, :mod:`zypper <salt.modules.zypperpkg>` and :mod:`apt <salt.modules.aptpkg>`
 
     :param str name:
         The name of the package to be downloaded. This parameter is ignored if
@@ -2312,7 +2396,7 @@ def downloaded(
             downloadonly=True,
             fromrepo=fromrepo,
             ignore_epoch=ignore_epoch,
-            **kwargs
+            **kwargs,
         )
         ret["result"] = True
         ret["changes"].update(pkg_ret)
@@ -2324,9 +2408,9 @@ def downloaded(
             ret["comment"] = exc.strerror_without_changes
         else:
             ret["changes"] = {}
-            ret[
-                "comment"
-            ] = "An error was encountered while downloading package(s): {}".format(exc)
+            ret["comment"] = (
+                f"An error was encountered while downloading package(s): {exc}"
+            )
         return ret
 
     new_pkgs = __salt__["pkg.list_downloaded"](**kwargs)
@@ -2335,7 +2419,7 @@ def downloaded(
     if failed:
         summary = ", ".join([_get_desired_pkg(x, targets) for x in failed])
         ret["result"] = False
-        ret["comment"] = "The following packages failed to download: {}".format(summary)
+        ret["comment"] = f"The following packages failed to download: {summary}"
 
     if not ret["changes"] and not ret["comment"]:
         ret["result"] = True
@@ -2364,7 +2448,7 @@ def patch_installed(name, advisory_ids=None, downloadonly=None, **kwargs):
         is not defined for that function, will be silently ignored.
 
     Currently supported for the following pkg providers:
-    :mod:`yumpkg <salt.modules.yumpkg>` and :mod:`zypper <salt.modules.zypper>`
+    :mod:`yum <salt.modules.yumpkg>` and :mod:`zypper <salt.modules.zypperpkg>`
 
     CLI Example:
 
@@ -2381,9 +2465,9 @@ def patch_installed(name, advisory_ids=None, downloadonly=None, **kwargs):
 
     if "pkg.list_patches" not in __salt__:
         ret["result"] = False
-        ret[
-            "comment"
-        ] = "The pkg.patch_installed state is not available on this platform"
+        ret["comment"] = (
+            "The pkg.patch_installed state is not available on this platform"
+        )
         return ret
 
     if isinstance(advisory_ids, list) and len(advisory_ids) == 0:
@@ -2404,9 +2488,9 @@ def patch_installed(name, advisory_ids=None, downloadonly=None, **kwargs):
 
     if __opts__["test"]:
         summary = ", ".join(targets)
-        ret[
-            "comment"
-        ] = "The following advisory patches would be downloaded: {}".format(summary)
+        ret["comment"] = (
+            f"The following advisory patches would be downloaded: {summary}"
+        )
         return ret
 
     try:
@@ -2423,18 +2507,18 @@ def patch_installed(name, advisory_ids=None, downloadonly=None, **kwargs):
             ret["comment"] = exc.strerror_without_changes
         else:
             ret["changes"] = {}
-            ret[
-                "comment"
-            ] = "An error was encountered while downloading package(s): {}".format(exc)
+            ret["comment"] = (
+                f"An error was encountered while downloading package(s): {exc}"
+            )
         return ret
 
     if not ret["changes"] and not ret["comment"]:
         status = "downloaded" if downloadonly else "installed"
         ret["result"] = True
-        ret[
-            "comment"
-        ] = "Advisory patch is not needed or related packages are already {}".format(
-            status
+        ret["comment"] = (
+            "Advisory patch is not needed or related packages are already {}".format(
+                status
+            )
         )
 
     return ret
@@ -2447,7 +2531,7 @@ def patch_downloaded(name, advisory_ids=None, **kwargs):
     Ensure that packages related to certain advisory ids are downloaded.
 
     Currently supported for the following pkg providers:
-    :mod:`yumpkg <salt.modules.yumpkg>` and :mod:`zypper <salt.modules.zypper>`
+    :mod:`yum <salt.modules.yumpkg>` and :mod:`zypper <salt.modules.zypperpkg>`
 
     CLI Example:
 
@@ -2486,9 +2570,11 @@ def latest(
     skip_verify=False,
     pkgs=None,
     watch_flags=True,
-    **kwargs
+    **kwargs,
 ):
     """
+    .. versionchanged:: 3007.0
+
     Ensure that the named package is installed and the latest available
     package. If the package can be updated, this state function will update
     the package. Generally it is better for the
@@ -2714,7 +2800,7 @@ def latest(
             # Package either a) is up-to-date, or b) does not exist
             if not cur.get(pkg):
                 # Package does not exist
-                msg = "No information found for '{}'.".format(pkg)
+                msg = f"No information found for '{pkg}'."
                 log.error(msg)
                 problems.append(msg)
             elif (
@@ -2759,18 +2845,16 @@ def latest(
                 if up_to_date_count <= 10:
                     comments.append(
                         "The following packages are already up-to-date: "
-                        + ", ".join(
-                            ["{} ({})".format(x, cur[x]) for x in sorted(up_to_date)]
-                        )
+                        + ", ".join([f"{x} ({cur[x]})" for x in sorted(up_to_date)])
                     )
                 else:
                     comments.append(
-                        "{} packages are already up-to-date".format(up_to_date_count)
+                        f"{up_to_date_count} packages are already up-to-date"
                     )
-
+            changes = _get_installable_versions(targets, cur)
             return {
                 "name": name,
-                "changes": {},
+                "changes": changes,
                 "result": None,
                 "comment": "\n".join(comments),
             }
@@ -2795,7 +2879,7 @@ def latest(
                 fromrepo=fromrepo,
                 skip_verify=skip_verify,
                 pkgs=targeted_pkgs,
-                **kwargs
+                **kwargs,
             )
         except CommandExecutionError as exc:
             return {
@@ -2815,7 +2899,8 @@ def latest(
                 x
                 for x in targets
                 if not changes.get(x)
-                or changes[x].get("new") != targets[x]
+                or changes[x].get("new") is not None
+                and targets[x] not in changes[x].get("new").split(",")
                 and targets[x] != "latest"
             ]
             successful = [x for x in targets if x not in failed]
@@ -2839,7 +2924,7 @@ def latest(
                         ", ".join(sorted(up_to_date))
                     )
                 else:
-                    msg = "{} packages were already up-to-date ".format(len(up_to_date))
+                    msg = f"{len(up_to_date)} packages were already up-to-date "
                 comments.append(msg)
 
             return {
@@ -2885,13 +2970,13 @@ def latest(
             }
     else:
         if len(desired_pkgs) > 10:
-            comment = "All {} packages are up-to-date.".format(len(desired_pkgs))
+            comment = f"All {len(desired_pkgs)} packages are up-to-date."
         elif len(desired_pkgs) > 1:
             comment = "All packages are up-to-date ({}).".format(
                 ", ".join(sorted(desired_pkgs))
             )
         else:
-            comment = "Package {} is already up-to-date".format(desired_pkgs[0])
+            comment = f"Package {desired_pkgs[0]} is already up-to-date"
 
         return {"name": name, "changes": {}, "result": True, "comment": comment}
 
@@ -2903,7 +2988,7 @@ def _uninstall(
     pkgs=None,
     normalize=True,
     ignore_epoch=None,
-    **kwargs
+    **kwargs,
 ):
     """
     Common function for package removal
@@ -2913,34 +2998,42 @@ def _uninstall(
             "name": name,
             "changes": {},
             "result": False,
-            "comment": "Invalid action '{}'. This is probably a bug.".format(action),
+            "comment": f"Invalid action '{action}'. This is probably a bug.",
         }
 
     try:
         pkg_params = __salt__["pkg_resource.parse_targets"](
-            name, pkgs, normalize=normalize
+            name, pkgs, normalize=normalize, version=version, **kwargs
         )[0]
     except MinionError as exc:
         return {
             "name": name,
             "changes": {},
             "result": False,
-            "comment": "An error was encountered while parsing targets: {}".format(exc),
+            "comment": f"An error was encountered while parsing targets: {exc}",
         }
     targets = _find_remove_targets(
         name, version, pkgs, normalize, ignore_epoch=ignore_epoch, **kwargs
     )
     if isinstance(targets, dict) and "result" in targets:
-        return targets
+        if action == "purge":
+            # found nothing, reset state return obj to empty list and check for removed to be purged
+            targets = []
+        else:
+            return targets
     elif not isinstance(targets, list):
-        return {
-            "name": name,
-            "changes": {},
-            "result": False,
-            "comment": "An error was encountered while checking targets: {}".format(
-                targets
-            ),
-        }
+        if action == "purge":
+            # found nothing, reset state return obj to empty list and check for removed to be purged
+            targets = []
+        else:
+            return {
+                "name": name,
+                "changes": {},
+                "result": False,
+                "comment": "An error was encountered while checking targets: {}".format(
+                    targets
+                ),
+            }
     if action == "purge":
         old_removed = __salt__["pkg.list_pkgs"](
             versions_as_list=True, removed=True, **kwargs
@@ -2959,9 +3052,8 @@ def _uninstall(
         }
 
     if __opts__["test"]:
-
         _changes = {}
-        _changes.update({x: {"new": "{}d".format(action), "old": ""} for x in targets})
+        _changes.update({x: {"new": f"{action}d", "old": ""} for x in targets})
 
         return {
             "name": name,
@@ -2972,13 +3064,22 @@ def _uninstall(
             ),
         }
 
-    changes = __salt__["pkg.{}".format(action)](
-        name, pkgs=pkgs, version=version, **kwargs
+    changes = __salt__[f"pkg.{action}"](
+        name, pkgs=pkgs, version=version, split_arch=False, **kwargs
     )
-    new = __salt__["pkg.list_pkgs"](versions_as_list=True, **kwargs)
+    list_pkgs_kwargs = dict(kwargs)
+    if __grains__.get("os_family") == "Windows":
+        # ``win_pkg.list_pkgs`` defaults include Windows Installer child products
+        # and updates. Those registry rows can remain (or repopulate) after the
+        # main application uninstall succeeds, so the parent key still appears
+        # in ``list_pkgs`` and ``pkg.removed`` would falsely fail. Match the
+        # primary Add/Remove Programs view when verifying removal.
+        list_pkgs_kwargs.setdefault("include_components", False)
+        list_pkgs_kwargs.setdefault("include_updates", False)
+    new = __salt__["pkg.list_pkgs"](versions_as_list=True, **list_pkgs_kwargs)
     failed = []
     for param in pkg_params:
-        if __grains__["os_family"] in ["Suse", "RedHat"]:
+        if __grains__["os_family"] in ["Suse", "RedHat", "Windows"]:
             # Check if the package version set to be removed is actually removed:
             if param in new and not pkg_params[param]:
                 failed.append(param)
@@ -3005,7 +3106,7 @@ def _uninstall(
         }
 
     comments = []
-    not_installed = sorted([x for x in pkg_params if x not in targets])
+    not_installed = sorted(x for x in pkg_params if x not in targets)
     if not_installed:
         comments.append(
             "The following packages were not installed: {}".format(
@@ -3016,7 +3117,7 @@ def _uninstall(
             "The following packages were {}d: {}.".format(action, ", ".join(targets))
         )
     else:
-        comments.append("All targeted packages were {}d.".format(action))
+        comments.append(f"All targeted packages were {action}d.")
 
     return {
         "name": name,
@@ -3102,7 +3203,7 @@ def removed(name, version=None, pkgs=None, normalize=True, ignore_epoch=None, **
             pkgs=pkgs,
             normalize=normalize,
             ignore_epoch=ignore_epoch,
-            **kwargs
+            **kwargs,
         )
     except CommandExecutionError as exc:
         ret = {"name": name, "result": False}
@@ -3112,9 +3213,9 @@ def removed(name, version=None, pkgs=None, normalize=True, ignore_epoch=None, **
             ret["comment"] = exc.strerror_without_changes
         else:
             ret["changes"] = {}
-            ret[
-                "comment"
-            ] = "An error was encountered while removing package(s): {}".format(exc)
+            ret["comment"] = (
+                f"An error was encountered while removing package(s): {exc}"
+            )
         return ret
 
 
@@ -3194,7 +3295,7 @@ def purged(name, version=None, pkgs=None, normalize=True, ignore_epoch=None, **k
             pkgs=pkgs,
             normalize=normalize,
             ignore_epoch=ignore_epoch,
-            **kwargs
+            **kwargs,
         )
     except CommandExecutionError as exc:
         ret = {"name": name, "result": False}
@@ -3204,9 +3305,7 @@ def purged(name, version=None, pkgs=None, normalize=True, ignore_epoch=None, **k
             ret["comment"] = exc.strerror_without_changes
         else:
             ret["changes"] = {}
-            ret[
-                "comment"
-            ] = "An error was encountered while purging package(s): {}".format(exc)
+            ret["comment"] = f"An error was encountered while purging package(s): {exc}"
         return ret
 
 
@@ -3219,36 +3318,25 @@ def uptodate(name, refresh=False, pkgs=None, **kwargs):
 
     Verify that the system is completely up to date.
 
-    name
+    :param str name
         The name has no functional value and is only used as a tracking
         reference
 
-    refresh
+    :param bool refresh
         refresh the package database before checking for new upgrades
 
-    pkgs
+    :param list pkgs
         list of packages to upgrade
-
-    :param str cache_valid_time:
-        This parameter sets the value in seconds after which cache marked as invalid,
-        and cache update is necessary. This overwrite ``refresh`` parameter
-        default behavior.
-
-        In this case cache_valid_time is set, refresh will not take place for
-        amount in seconds since last ``apt-get update`` executed on the system.
-
-        .. note::
-
-            This parameter available only on Debian based distributions, and
-            have no effect on the rest.
 
     :param bool resolve_capabilities:
         Turn on resolving capabilities. This allow one to name "provides" or alias names for packages.
 
         .. versionadded:: 2018.3.0
 
-    kwargs
-        Any keyword arguments to pass through to ``pkg.upgrade``.
+    :param kwargs
+        Any keyword arguments to pass through to the ``pkg`` module.
+
+        For example, for apt systems: `dist_upgrade`, `cache_valid_time`, `force_conf_new`
 
         .. versionadded:: 2015.5.0
     """
@@ -3307,9 +3395,7 @@ def uptodate(name, refresh=False, pkgs=None, **kwargs):
             ret["comment"] = exc.strerror_without_changes
         else:
             ret["changes"] = {}
-            ret[
-                "comment"
-            ] = "An error was encountered while updating packages: {}".format(exc)
+            ret["comment"] = f"An error was encountered while updating packages: {exc}"
         return ret
 
     # If a package list was provided, ensure those packages were updated
@@ -3336,9 +3422,16 @@ def group_installed(name, skip=None, include=None, **kwargs):
     .. versionchanged:: 2016.11.0
         Added support in :mod:`pacman <salt.modules.pacman>`
 
+    .. versionchanged:: 3006.2
+        For RPM-based systems, support for ``fromrepo``, ``enablerepo``, and
+        ``disablerepo`` (as used in :py:func:`pkg.install
+        <salt.modules.yumpkg.install>`) has been added. This allows one to, for
+        example, use ``enablerepo`` to perform a group install from a repo that
+        is otherwise disabled.
+
     Ensure that an entire package group is installed. This state is currently
-    only supported for the :mod:`yum <salt.modules.yumpkg>` and :mod:`pacman <salt.modules.pacman>`
-    package managers.
+    only supported for the :mod:`yum <salt.modules.yumpkg>` and :mod:`pacman
+    <salt.modules.pacman>` package managers.
 
     skip
         Packages that would normally be installed by the package group
@@ -3367,6 +3460,45 @@ def group_installed(name, skip=None, include=None, **kwargs):
         .. versionchanged:: 2016.3.0
             This option can no longer be passed as a comma-separated list, it
             must now be passed as a list (as shown in the above example).
+
+    .. note::
+        The below options are only supported on RPM-based systems
+
+    fromrepo
+        Restrict ``yum groupinfo`` to the specified repo(s).
+        (e.g., ``yum --disablerepo='*' --enablerepo='somerepo'``)
+
+        .. code-block:: yaml
+
+            MyGroup:
+              pkg.group_installed:
+                - fromrepo: base,updates
+
+        .. versionadded:: 3006.2
+
+    enablerepo (ignored if ``fromrepo`` is specified)
+        Specify a disabled package repository (or repositories) to enable.
+        (e.g., ``yum --enablerepo='somerepo'``)
+
+        .. code-block:: yaml
+
+            MyGroup:
+              pkg.group_installed:
+                - enablerepo: myrepo
+
+        .. versionadded:: 3006.2
+
+    disablerepo (ignored if ``fromrepo`` is specified)
+        Specify an enabled package repository (or repositories) to disable.
+        (e.g., ``yum --disablerepo='somerepo'``)
+
+        .. code-block:: yaml
+
+            MyGroup:
+              pkg.group_installed:
+                - disablerepo: epel
+
+        .. versionadded:: 3006.2
 
     .. note::
         Because this is essentially a wrapper around :py:func:`pkg.install
@@ -3401,33 +3533,37 @@ def group_installed(name, skip=None, include=None, **kwargs):
                 include[idx] = str(item)
 
     try:
-        diff = __salt__["pkg.group_diff"](name)
-    except CommandExecutionError as err:
-        ret[
-            "comment"
-        ] = "An error was encountered while installing/updating group '{}': {}.".format(
-            name, err
+        diff = __salt__["pkg.group_diff"](
+            name, **salt.utils.args.clean_kwargs(**kwargs)
         )
+    except (CommandExecutionError, TypeError) as err:
+        if "unexpected keyword argument" in str(err):
+            ret["comment"] = "Repo options are not supported on this platform"
+        else:
+            ret["comment"] = (
+                f"An error was encountered while installing/updating group '{name}': {err}."
+            )
         return ret
 
     mandatory = diff["mandatory"]["installed"] + diff["mandatory"]["not installed"]
 
     invalid_skip = [x for x in mandatory if x in skip]
     if invalid_skip:
-        ret[
-            "comment"
-        ] = "The following mandatory packages cannot be skipped: {}".format(
-            ", ".join(invalid_skip)
+        ret["comment"] = (
+            "The following mandatory packages cannot be skipped: {}".format(
+                ", ".join(invalid_skip)
+            )
         )
         return ret
 
-    targets = diff["mandatory"]["not installed"]
+    mandatory_targets = list(diff["mandatory"]["not installed"])
+    targets = list(mandatory_targets)
     targets.extend([x for x in diff["default"]["not installed"] if x not in skip])
     targets.extend(include)
 
     if not targets:
         ret["result"] = True
-        ret["comment"] = "Group '{}' is already installed".format(name)
+        ret["comment"] = f"Group '{name}' is already installed"
         return ret
 
     partially_installed = (
@@ -3439,11 +3575,11 @@ def group_installed(name, skip=None, include=None, **kwargs):
     if __opts__["test"]:
         ret["result"] = None
         if partially_installed:
-            ret[
-                "comment"
-            ] = "Group '{}' is partially installed and will be updated".format(name)
+            ret["comment"] = (
+                f"Group '{name}' is partially installed and will be updated"
+            )
         else:
-            ret["comment"] = "Group '{}' will be installed".format(name)
+            ret["comment"] = f"Group '{name}' will be installed"
         return ret
 
     try:
@@ -3462,7 +3598,17 @@ def group_installed(name, skip=None, include=None, **kwargs):
             )
         return ret
 
-    failed = [x for x in targets if x not in __salt__["pkg.list_pkgs"](**kwargs)]
+    # Only flag a failure when a *mandatory* group member is missing after
+    # install, or when an explicitly user-requested ``include`` package is
+    # missing. Default/optional group members that the package manager could
+    # not install (e.g. arch-specific subpackages not present in any enabled
+    # repo) match the underlying ``yum/dnf group install`` behavior, which
+    # reports "No match for group package <X>" and still exits 0. Treating
+    # those as state failures contradicts the package manager's own result
+    # and surfaces as a spurious red state run -- see #68210.
+    required = list(mandatory_targets) + list(include)
+    installed_pkgs = __salt__["pkg.list_pkgs"](**kwargs)
+    failed = [x for x in required if x not in installed_pkgs]
     if failed:
         ret["comment"] = "Failed to install the following packages: {}".format(
             ", ".join(failed)
@@ -3510,8 +3656,6 @@ def mod_aggregate(low, chunks, running):
     The mod_aggregate function which looks up all packages in the available
     low chunks and merges them into a single pkgs ref in the present low data
     """
-    pkgs = []
-    pkg_type = None
     agg_enabled = [
         "installed",
         "latest",
@@ -3520,6 +3664,9 @@ def mod_aggregate(low, chunks, running):
     ]
     if low.get("fun") not in agg_enabled:
         return low
+    is_sources = "sources" in low
+    # use a dict instead of a set to maintain insertion order
+    pkgs = {}
     for chunk in chunks:
         tag = __utils__["state.gen_tag"](chunk)
         if tag in running:
@@ -3534,40 +3681,50 @@ def mod_aggregate(low, chunks, running):
             # Check for the same repo
             if chunk.get("fromrepo") != low.get("fromrepo"):
                 continue
+            # If hold exists in the chunk, do not add to aggregation
+            # otherwise all packages will be held or unheld.
+            # setting a package to be held/unheld is not as
+            # time consuming as installing/uninstalling.
+            if "hold" in chunk:
+                continue
             # Check first if 'sources' was passed so we don't aggregate pkgs
             # and sources together.
-            if "sources" in chunk:
-                if pkg_type is None:
-                    pkg_type = "sources"
-                if pkg_type == "sources":
-                    pkgs.extend(chunk["sources"])
+            if is_sources and "sources" in chunk:
+                _combine_pkgs(pkgs, chunk["sources"])
+                chunk["__agg__"] = True
+            elif not is_sources:
+                # Pull out the pkg names!
+                if "pkgs" in chunk:
+                    _combine_pkgs(pkgs, chunk["pkgs"])
                     chunk["__agg__"] = True
-            else:
-                # If hold exists in the chunk, do not add to aggregation
-                # otherwise all packages will be held or unheld.
-                # setting a package to be held/unheld is not as
-                # time consuming as installing/uninstalling.
-                if "hold" not in chunk:
-                    if pkg_type is None:
-                        pkg_type = "pkgs"
-                    if pkg_type == "pkgs":
-                        # Pull out the pkg names!
-                        if "pkgs" in chunk:
-                            pkgs.extend(chunk["pkgs"])
-                            chunk["__agg__"] = True
-                        elif "name" in chunk:
-                            version = chunk.pop("version", None)
-                            if version is not None:
-                                pkgs.append({chunk["name"]: version})
-                            else:
-                                pkgs.append(chunk["name"])
-                            chunk["__agg__"] = True
-    if pkg_type is not None and pkgs:
-        if pkg_type in low:
-            low[pkg_type].extend(pkgs)
-        else:
-            low[pkg_type] = pkgs
+                elif "name" in chunk:
+                    version = chunk.pop("version", None)
+                    pkgs.setdefault(chunk["name"], set()).add(version)
+                    chunk["__agg__"] = True
+    if pkgs:
+        pkg_type = "sources" if is_sources else "pkgs"
+        low_pkgs = {}
+        _combine_pkgs(low_pkgs, low.get(pkg_type, []))
+        for pkg, values in pkgs.items():
+            low_pkgs.setdefault(pkg, {None}).update(values)
+        # the value is the version for pkgs and
+        # the URI for sources
+        low_pkgs_list = [
+            name if value is None else {name: value}
+            for name, values in low_pkgs.items()
+            for value in values
+        ]
+        low[pkg_type] = low_pkgs_list
     return low
+
+
+def _combine_pkgs(pkgs_dict, additional_pkgs_list):
+    for item in additional_pkgs_list:
+        if isinstance(item, str):
+            pkgs_dict.setdefault(item, {None})
+        else:
+            for pkg, version in item:
+                pkgs_dict.setdefault(pkg, {None}).add(version)
 
 
 def mod_watch(name, **kwargs):
@@ -3592,7 +3749,7 @@ def mod_watch(name, **kwargs):
     return {
         "name": name,
         "changes": {},
-        "comment": "pkg.{} does not work with the watch requisite".format(sfun),
+        "comment": f"pkg.{sfun} does not work with the watch requisite",
         "result": False,
     }
 
@@ -3616,7 +3773,7 @@ def mod_beacon(name, **kwargs):
         if kwargs.get("beacon"):
             beacon_module = "pkg"
 
-            beacon_name = "beacon_{}_{}".format(beacon_module, name)
+            beacon_name = f"beacon_{beacon_module}_{name}"
 
             beacon_kwargs = {
                 "name": beacon_name,
@@ -3644,3 +3801,427 @@ def mod_beacon(name, **kwargs):
             ),
             "result": False,
         }
+
+
+def held(name, version=None, pkgs=None, replace=False, **kwargs):
+    """
+    .. versionadded:: 3005
+
+    Set package in 'hold' state, meaning it will not be changed.
+
+    :param str name:
+        The name of the package to be held. This parameter is ignored
+        if ``pkgs`` is used.
+
+    :param str version:
+        Hold a specific version of a package.
+        Full description of this parameter is in `installed` function.
+
+        .. note::
+
+            This parameter make sense for Zypper-based systems.
+            Ignored for YUM/DNF and APT
+
+    :param list pkgs:
+        A list of packages to be held. All packages listed under ``pkgs``
+        will be held.
+
+        .. code-block:: yaml
+
+            mypkgs:
+              pkg.held:
+                - pkgs:
+                  - foo
+                  - bar: 1.2.3-4
+                  - baz
+
+        .. note::
+
+            For Zypper-based systems the package could be held for
+            the version specified. YUM/DNF and APT ingore it.
+
+    :param bool replace:
+        Force replacement of existings holds with specified.
+        By default, this parameter is set to ``False``.
+    """
+
+    if isinstance(pkgs, list) and len(pkgs) == 0 and not replace:
+        return {
+            "name": name,
+            "changes": {},
+            "result": True,
+            "comment": "No packages to be held provided",
+        }
+
+    # If just a name (and optionally a version) is passed, just pack them into
+    # the pkgs argument.
+    if name and pkgs is None:
+        if version:
+            pkgs = [{name: version}]
+            version = None
+        else:
+            pkgs = [name]
+
+    locks = {}
+    vr_lock = False
+    if "pkg.list_locks" in __salt__:
+        locks = __salt__["pkg.list_locks"]()
+        vr_lock = True
+    elif "pkg.list_holds" in __salt__:
+        _locks = __salt__["pkg.list_holds"](full=True)
+        lock_re = re.compile(r"^(.+)-(\d+):(.*)\.\*")
+        for lock in _locks:
+            match = lock_re.match(lock)
+            if match:
+                epoch = match.group(2)
+                if epoch == "0":
+                    epoch = ""
+                else:
+                    epoch = f"{epoch}:"
+                locks.update({match.group(1): {"version": f"{epoch}{match.group(3)}"}})
+            else:
+                locks.update({lock: {}})
+    elif "pkg.get_selections" in __salt__:
+        _locks = __salt__["pkg.get_selections"](state="hold")
+        for lock in _locks.get("hold", []):
+            locks.update({lock: {}})
+    else:
+        return {
+            "name": name,
+            "changes": {},
+            "result": False,
+            "comment": "No any function to get the list of held packages available.\n"
+            "Check if the package manager supports package locking.",
+        }
+
+    if "pkg.hold" not in __salt__:
+        return {
+            "name": name,
+            "changes": {},
+            "result": False,
+            "comment": "`hold` function is not implemented for the package manager.",
+        }
+
+    ret = {"name": name, "changes": {}, "result": True, "comment": ""}
+    comments = []
+
+    held_pkgs = set()
+    for pkg in pkgs:
+        if isinstance(pkg, dict):
+            (pkg_name, pkg_ver) = next(iter(pkg.items()))
+        else:
+            pkg_name = pkg
+            pkg_ver = None
+        lock_ver = None
+        if pkg_name in locks and "version" in locks[pkg_name]:
+            lock_ver = locks[pkg_name]["version"]
+            lock_ver = lock_ver.lstrip("= ")
+        held_pkgs.add(pkg_name)
+        if pkg_name not in locks or (vr_lock and lock_ver != pkg_ver):
+            if __opts__["test"]:
+                if pkg_name in locks:
+                    comments.append(
+                        "The following package's hold rule would be updated: {}{}".format(
+                            pkg_name,
+                            "" if not pkg_ver else f" (version = {pkg_ver})",
+                        )
+                    )
+                else:
+                    comments.append(
+                        "The following package would be held: {}{}".format(
+                            pkg_name,
+                            "" if not pkg_ver else f" (version = {pkg_ver})",
+                        )
+                    )
+            else:
+                unhold_ret = None
+                if pkg_name in locks:
+                    unhold_ret = __salt__["pkg.unhold"](name=name, pkgs=[pkg_name])
+                hold_ret = __salt__["pkg.hold"](name=name, pkgs=[pkg])
+                if not hold_ret.get(pkg_name, {}).get("result", False):
+                    ret["result"] = False
+                if (
+                    unhold_ret
+                    and unhold_ret.get(pkg_name, {}).get("result", False)
+                    and hold_ret
+                    and hold_ret.get(pkg_name, {}).get("result", False)
+                ):
+                    comments.append(f"Package {pkg_name} was updated with hold rule")
+                elif hold_ret and hold_ret.get(pkg_name, {}).get("result", False):
+                    comments.append(f"Package {pkg_name} is now being held")
+                else:
+                    comments.append(f"Package {pkg_name} was not held")
+                ret["changes"].update(hold_ret)
+
+    if replace:
+        for pkg_name in locks:
+            if locks[pkg_name].get("type", "package") != "package":
+                continue
+            if __opts__["test"]:
+                if pkg_name not in held_pkgs:
+                    comments.append(
+                        f"The following package would be unheld: {pkg_name}"
+                    )
+            else:
+                if pkg_name not in held_pkgs:
+                    unhold_ret = __salt__["pkg.unhold"](name=name, pkgs=[pkg_name])
+                    if not unhold_ret.get(pkg_name, {}).get("result", False):
+                        ret["result"] = False
+                    if unhold_ret and unhold_ret.get(pkg_name, {}).get("comment"):
+                        comments.append(unhold_ret.get(pkg_name).get("comment"))
+                    ret["changes"].update(unhold_ret)
+
+    ret["comment"] = "\n".join(comments)
+    if not (ret["changes"] or ret["comment"]):
+        ret["comment"] = "No changes made"
+
+    return ret
+
+
+def trusted(name, **kwargs):
+    """
+    Ensure a package source or component is marked as trusted by the package
+    manager. Only available for package managers that implement a trust model
+    (e.g. Homebrew on macOS).
+
+    .. versionadded:: 3008.2
+
+    name
+        The identifier of the package source or component to trust. The exact
+        format depends on the package manager (e.g. a tap name, a formula, a
+        URL).
+
+    kwargs
+        Additional keyword arguments are passed through to the underlying
+        ``pkg.trust`` and ``pkg.is_trusted`` module functions, allowing
+        package-manager-specific options to be supplied. For example, on macOS
+        with Homebrew, ``type`` can be set to ``tap``, ``formula``, ``cask``
+        or ``command`` to disambiguate the target.
+
+    Examples:
+
+    .. code-block:: yaml
+
+        # Homebrew: trust a third-party tap
+        cdalvaro/tap:
+          pkg.trusted:
+            - type: tap
+
+        # Homebrew: trust a specific formula from a third-party tap
+        cdalvaro/tap/salt:
+          pkg.trusted:
+            - type: formula
+    """
+    ret = {"name": name, "changes": {}, "result": True, "comment": ""}
+
+    if "pkg.trust" not in __salt__:
+        ret["result"] = False
+        ret["comment"] = "`trust` is not available for this package manager."
+        return ret
+
+    if __salt__["pkg.is_trusted"](name, **kwargs):
+        ret["comment"] = f"{name} is already trusted."
+        return ret
+
+    if __opts__["test"]:
+        ret["result"] = None
+        ret["comment"] = f"{name} would be trusted."
+        return ret
+
+    if not __salt__["pkg.trust"](name, **kwargs):
+        ret["result"] = False
+        ret["comment"] = f"Failed to trust {name}."
+        return ret
+
+    ret["changes"] = {name: {"old": "untrusted", "new": "trusted"}}
+    ret["comment"] = f"{name} is now trusted."
+    return ret
+
+
+def untrusted(name, **kwargs):
+    """
+    Ensure a package source or component is not marked as trusted by the
+    package manager. Only available for package managers that implement a
+    trust model (e.g. Homebrew on macOS).
+
+    .. versionadded:: 3008.2
+
+    name
+        The identifier of the package source or component to untrust. The
+        exact format depends on the package manager.
+
+    kwargs
+        Additional keyword arguments are passed through to the underlying
+        ``pkg.untrust`` and ``pkg.is_trusted`` module functions, allowing
+        package-manager-specific options to be supplied. For example, on macOS
+        with Homebrew, ``type`` can be set to ``tap``, ``formula``, ``cask``
+        or ``command`` to disambiguate the target.
+
+    Example:
+
+    .. code-block:: yaml
+
+        # Homebrew: remove trust from a third-party tap
+        cdalvaro/tap:
+          pkg.untrusted:
+            - type: tap
+    """
+    ret = {"name": name, "changes": {}, "result": True, "comment": ""}
+
+    if "pkg.untrust" not in __salt__:
+        ret["result"] = False
+        ret["comment"] = "`untrust` is not available for this package manager."
+        return ret
+
+    if not __salt__["pkg.is_trusted"](name, **kwargs):
+        ret["comment"] = f"{name} is already not trusted."
+        return ret
+
+    if __opts__["test"]:
+        ret["result"] = None
+        ret["comment"] = f"{name} would be untrusted."
+        return ret
+
+    if not __salt__["pkg.untrust"](name, **kwargs):
+        ret["result"] = False
+        ret["comment"] = f"Failed to untrust {name}."
+        return ret
+
+    ret["changes"] = {name: {"old": "trusted", "new": "untrusted"}}
+    ret["comment"] = f"{name} is no longer trusted."
+    return ret
+
+
+def unheld(name, version=None, pkgs=None, all=False, **kwargs):
+    """
+    .. versionadded:: 3005
+
+    Unset package from 'hold' state, to allow operations with the package.
+
+    :param str name:
+        The name of the package to be unheld. This parameter is ignored
+        if ``pkgs`` is used.
+
+    :param str version:
+        Unhold a specific version of a package.
+        Full description of this parameter is in `installed` function.
+
+        .. note::
+
+            This parameter make sense for Zypper-based systems.
+            Ignored for YUM/DNF and APT
+
+    :param list pkgs:
+        A list of packages to be unheld. All packages listed under ``pkgs``
+        will be unheld.
+
+        .. code-block:: yaml
+
+            mypkgs:
+              pkg.unheld:
+                - pkgs:
+                  - foo
+                  - bar: 1.2.3-4
+                  - baz
+
+        .. note::
+
+            For Zypper-based systems the package could be held for
+            the version specified. YUM/DNF and APT ingore it.
+            For ``unheld`` there is no need to specify the exact version
+            to be unheld.
+
+            Package naming rules for held packages may vary by package manager.
+            See the documentation for your platform's ``pkg`` module for any
+            provider-specific requirements.
+
+    :param bool all:
+        Force removing of all existings locks.
+        By default, this parameter is set to ``False``.
+    """
+
+    if isinstance(pkgs, list) and len(pkgs) == 0 and not all:
+        return {
+            "name": name,
+            "changes": {},
+            "result": True,
+            "comment": "No packages to be unheld provided",
+        }
+
+    # If just a name (and optionally a version) is passed, just pack them into
+    # the pkgs argument.
+    if name and pkgs is None:
+        pkgs = [{name: version}]
+        version = None
+
+    locks = {}
+    vr_lock = False
+    if "pkg.list_locks" in __salt__:
+        locks = __salt__["pkg.list_locks"]()
+        vr_lock = True
+    elif "pkg.list_holds" in __salt__:
+        _locks = __salt__["pkg.list_holds"](full=True)
+        lock_re = re.compile(r"^(.+)-(\d+):(.*)\.\*")
+        for lock in _locks:
+            match = lock_re.match(lock)
+            if match:
+                epoch = match.group(2)
+                if epoch == "0":
+                    epoch = ""
+                else:
+                    epoch = f"{epoch}:"
+                locks.update({match.group(1): {"version": f"{epoch}{match.group(3)}"}})
+            else:
+                locks.update({lock: {}})
+    elif "pkg.get_selections" in __salt__:
+        _locks = __salt__["pkg.get_selections"](state="hold")
+        for lock in _locks.get("hold", []):
+            locks.update({lock: {}})
+    else:
+        return {
+            "name": name,
+            "changes": {},
+            "result": False,
+            "comment": "No any function to get the list of held packages available.\n"
+            "Check if the package manager supports package locking.",
+        }
+
+    dpkgs = {}
+    for pkg in pkgs:
+        if isinstance(pkg, dict):
+            (pkg_name, pkg_ver) = next(iter(pkg.items()))
+            dpkgs.update({pkg_name: pkg_ver})
+        else:
+            dpkgs.update({pkg: None})  # pylint: disable=unhashable-member
+
+    ret = {"name": name, "changes": {}, "result": True, "comment": ""}
+    comments = []
+
+    for pkg_name in locks:
+        if locks[pkg_name].get("type", "package") != "package":
+            continue
+        lock_ver = None
+        if vr_lock and "version" in locks[pkg_name]:
+            lock_ver = locks[pkg_name]["version"]
+            lock_ver = lock_ver.lstrip("= ")
+        if all or (pkg_name in dpkgs and (not lock_ver or lock_ver == dpkgs[pkg_name])):
+            if __opts__["test"]:
+                comments.append(
+                    "The following package would be unheld: {}{}".format(
+                        pkg_name,
+                        "" if not dpkgs.get(pkg_name) else f" (version = {lock_ver})",
+                    )
+                )
+            else:
+                unhold_ret = __salt__["pkg.unhold"](name=name, pkgs=[pkg_name])
+                if not unhold_ret.get(pkg_name, {}).get("result", False):
+                    ret["result"] = False
+                if unhold_ret and unhold_ret.get(pkg_name, {}).get("comment"):
+                    comments.append(unhold_ret.get(pkg_name).get("comment"))
+                ret["changes"].update(unhold_ret)
+
+    ret["comment"] = "\n".join(comments)
+    if not (ret["changes"] or ret["comment"]):
+        ret["comment"] = "No changes made"
+
+    return ret

@@ -4,8 +4,20 @@ Microsoft certificate management via the Pki PowerShell module.
 :platform:      Windows
 
 .. versionadded:: 2016.11.0
-"""
 
+The ``context`` argument refers to the certificate-store location, either
+``LocalMachine`` or ``CurrentUser``. The ``store`` argument refers to one of
+the standard Microsoft certificate stores within that location (for example
+``My``, ``Root``, ``CA``, ``AuthRoot``, ``TrustedPublisher``,
+``TrustedPeople``, ``Disallowed``, ``WebHosting``, ``Remote Desktop``).
+List the stores actually available on a minion with PowerShell::
+
+    PS C:\\> Set-Location Cert:\\LocalMachine
+    PS Cert:\\LocalMachine> Get-ChildItem
+
+or by calling :py:func:`win_pki.get_stores
+<salt.modules.win_pki.get_stores>`.
+"""
 
 _DEFAULT_CONTEXT = "LocalMachine"
 _DEFAULT_FORMAT = "cer"
@@ -65,7 +77,7 @@ def import_cert(
     """
     ret = {"name": name, "changes": dict(), "comment": "", "result": None}
 
-    store_path = r"Cert:\{}\{}".format(context, store)
+    store_path = rf"Cert:\{context}\{store}"
 
     cached_source_path = __salt__["cp.cache_file"](name, saltenv)
     current_certs = __salt__["win_pki.get_certs"](context=context, store=store)
@@ -104,10 +116,10 @@ def import_cert(
                 cert_props["thumbprint"], store_path
             )
         else:
-            ret[
-                "comment"
-            ] = "Certificate '{}' unable to be imported into store: {}".format(
-                cert_props["thumbprint"], store_path
+            ret["comment"] = (
+                "Certificate '{}' unable to be imported into store: {}".format(
+                    cert_props["thumbprint"], store_path
+                )
             )
     return ret
 
@@ -140,7 +152,7 @@ def remove_cert(name, thumbprint, context=_DEFAULT_CONTEXT, store=_DEFAULT_STORE
     """
     ret = {"name": name, "changes": dict(), "comment": "", "result": None}
 
-    store_path = r"Cert:\{}\{}".format(context, store)
+    store_path = rf"Cert:\{context}\{store}"
     current_certs = __salt__["win_pki.get_certs"](context=context, store=store)
 
     if thumbprint not in current_certs:
@@ -163,9 +175,9 @@ def remove_cert(name, thumbprint, context=_DEFAULT_CONTEXT, store=_DEFAULT_STORE
                 thumbprint, store_path
             )
         else:
-            ret[
-                "comment"
-            ] = "Certificate '{}' unable to be removed from store: {}".format(
-                thumbprint, store_path
+            ret["comment"] = (
+                "Certificate '{}' unable to be removed from store: {}".format(
+                    thumbprint, store_path
+                )
             )
     return ret

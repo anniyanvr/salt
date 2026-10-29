@@ -150,7 +150,7 @@ def update():
         salt.fileserver.reap_fileserver_cache_dir(
             os.path.join(__opts__["cachedir"], "minionfs/hash"), find_file
         )
-    except os.error:
+    except OSError:
         # Hash file won't exist if no files have yet been served up
         pass
 
@@ -204,7 +204,7 @@ def file_hash(load, fnd):
                     ret["hsum"] = hsum
                     return ret
         # Can't use Python select() because we need Windows support
-        except os.error:
+        except OSError:
             log.debug("Fileserver encountered lock when reading cache file. Retrying.")
             file_hash(load, fnd)
             return ret
@@ -238,6 +238,13 @@ def file_list(load):
         prefix = prefix[len(mountpoint + os.path.sep) :]
 
     minions_cache_dir = os.path.join(__opts__["cachedir"], "minions")
+    if not os.path.isdir(minions_cache_dir):
+        # The minions cache dir may not exist yet (e.g. under the salt-ssh
+        # shim, where the cachedir is a fresh temp dir with no pushed files).
+        log.debug(
+            "minionfs: minions cache directory %s does not exist", minions_cache_dir
+        )
+        return []
     minion_dirs = os.listdir(minions_cache_dir)
 
     # If the prefix is not an empty string, then get the minion id from it. The
@@ -314,6 +321,13 @@ def dir_list(load):
         prefix = prefix[len(mountpoint + os.path.sep) :]
 
     minions_cache_dir = os.path.join(__opts__["cachedir"], "minions")
+    if not os.path.isdir(minions_cache_dir):
+        # The minions cache dir may not exist yet (e.g. under the salt-ssh
+        # shim, where the cachedir is a fresh temp dir with no pushed files).
+        log.debug(
+            "minionfs: minions cache directory %s does not exist", minions_cache_dir
+        )
+        return []
     minion_dirs = os.listdir(minions_cache_dir)
 
     # If the prefix is not an empty string, then get the minion id from it. The

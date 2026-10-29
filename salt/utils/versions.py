@@ -1,47 +1,113 @@
 """
-    :copyright: Copyright 2017 by the SaltStack Team, see AUTHORS for more details.
-    :license: Apache 2.0, see LICENSE for more details.
-
-
     salt.utils.versions
     ~~~~~~~~~~~~~~~~~~~
 
-    Version parsing based on distutils.version which works under python 3
-    because on python 3 you can no longer compare strings against integers.
+    Version parsing based on `packaging.version` and `looseversion.LooseVersion`
+    which works under python 3 because on python 3 you can no longer compare
+    strings against integers.
 """
 
-
+import collections
 import datetime
+import functools
 import inspect
 import logging
 import numbers
+import os
 import sys
 import warnings
 
-# pylint: disable=blacklisted-module
-from distutils.version import LooseVersion as _LooseVersion
-from distutils.version import StrictVersion as _StrictVersion
+import looseversion
+import packaging.version
 
-# pylint: enable=blacklisted-module
 import salt.version
 
 log = logging.getLogger(__name__)
 
 
-class StrictVersion(_StrictVersion):
-    def parse(self, vstring):
-        _StrictVersion.parse(self, vstring)
+# PERF: warn_until() is called on every hot-path event (deprecated
+# transport class aliases fire it per instantiation).  A memray capture
+# on the master's EventPublisher under stress showed 1.4M
+# ``packaging.version.Version`` allocations totaling 2.5 GB in 90 s —
+# all from ``SaltStackVersion`` construction inside warn_until().  Both
+# the target and the current version are effectively immutable within a
+# process (same version.info the whole time, same numeric constant
+# arguments at call sites like ``warn_until(3009, "...")``), so cache
+# the resolved objects.
+@functools.lru_cache(maxsize=32)
+def _resolve_target_version_hashable(version):
+    """Resolve target-version input to a SaltStackVersion, cached.
 
-    def _cmp(self, other):
+    Handles the common hashable inputs (int, plain tuple, str) that
+    dominate warn_until() call sites.  ``SaltVersion`` and
+    ``SaltStackVersion`` targets are handled inline in warn_until()
+    without caching (SaltVersion is a namedtuple with unhashable
+    semantics and a ``(name, info, released)`` shape, so it must be
+    routed away from this fast path).
+    """
+    if isinstance(version, int):
+        return salt.version.SaltStackVersion(version)
+    if isinstance(version, tuple):
+        return salt.version.SaltStackVersion(*version)
+    if isinstance(version, str):
+        if version.lower() not in salt.version.SaltStackVersion.LNAMES:
+            raise RuntimeError(
+                "Incorrect spelling for the release name in the warn_utils "
+                "call. Expecting one of these release names: {}".format(
+                    [vs.name for vs in salt.version.SaltVersionsInfo.versions()]
+                )
+            )
+        return salt.version.SaltStackVersion.from_name(version)
+    # Signal to caller: not a hashable case we handle here.
+    return None
+
+
+@functools.lru_cache(maxsize=8)
+def _resolve_current_version(version_info):
+    """Cache SaltStackVersion(*version_info) — the current running version.
+
+    ``salt.version.__version_info__`` is immutable within a process, so
+    this is effectively a one-time construction shared across every
+    warn_until() call.
+    """
+    return salt.version.SaltStackVersion(*version_info)
+
+
+class Version(packaging.version.Version):
+    def __lt__(self, other):
         if isinstance(other, str):
-            other = StrictVersion(other)
-        return _StrictVersion._cmp(self, other)
+            other = Version(other)
+        return super().__lt__(other)
+
+    def __le__(self, other):
+        if isinstance(other, str):
+            other = Version(other)
+        return super().__le__(other)
+
+    def __eq__(self, other):
+        if isinstance(other, str):
+            other = Version(other)
+        return super().__eq__(other)
+
+    def __ge__(self, other):
+        if isinstance(other, str):
+            other = Version(other)
+        return super().__ge__(other)
+
+    def __gt__(self, other):
+        if isinstance(other, str):
+            other = Version(other)
+        return super().__gt__(other)
+
+    def __ne__(self, other):
+        if isinstance(other, str):
+            other = Version(other)
+        return super().__ne__(other)
 
 
-class LooseVersion(_LooseVersion):
+class LooseVersion(looseversion.LooseVersion):
     def parse(self, vstring):
-        _LooseVersion.parse(self, vstring)
-
+        super().parse(vstring)
         # Convert every part of the version to string in order to be able to compare
         self._str_version = [
             str(vp).zfill(8) if isinstance(vp, int) else vp for vp in self.version
@@ -58,7 +124,7 @@ class LooseVersion(_LooseVersion):
                 break
 
         if string_in_version is False:
-            return _LooseVersion._cmp(self, other)
+            return super()._cmp(other)
 
         # If we reached this far, it means at least a part of the version contains a string
         # In python 3, strings and integers are not comparable
@@ -75,7 +141,7 @@ def _format_warning(message, category, filename, lineno, line=None):
     Replacement for warnings.formatwarning that disables the echoing of
     the 'line' parameter.
     """
-    return "{}:{}: {}: {}\n".format(filename, lineno, category.__name__, message)
+    return f"{filename}:{lineno}: {category.__name__}: {message}\n"
 
 
 def warn_until(
@@ -108,21 +174,16 @@ def warn_until(
                                 issued. When we're only after the salt version
                                 checks to raise a ``RuntimeError``.
     """
+    # PERF: fast path for the common hashable inputs (int, plain tuple,
+    # str) via a small lru_cache.  ``SaltVersion`` is a namedtuple so it
+    # also matches ``isinstance(version, tuple)``, but it defines
+    # ``__eq__`` without ``__hash__`` (i.e. it is unhashable) *and* its
+    # tuple form is ``(name, info, released)`` rather than version parts
+    # — handle it explicitly before the fast path.
     if isinstance(version, salt.version.SaltVersion):
         version = salt.version.SaltStackVersion(*version.info)
-    elif isinstance(version, int):
-        version = salt.version.SaltStackVersion(version)
-    elif isinstance(version, tuple):
-        version = salt.version.SaltStackVersion(*version)
-    elif isinstance(version, str):
-        if version.lower() not in salt.version.SaltStackVersion.LNAMES:
-            raise RuntimeError(
-                "Incorrect spelling for the release name in the warn_utils "
-                "call. Expecting one of these release names: {}".format(
-                    [vs.name for vs in salt.version.SaltVersionsInfo.versions()]
-                )
-            )
-        version = salt.version.SaltStackVersion.from_name(version)
+    elif isinstance(version, (int, tuple, str)):
+        version = _resolve_target_version_hashable(version)
     elif not isinstance(version, salt.version.SaltStackVersion):
         raise RuntimeError(
             "The 'version' argument should be passed as a tuple, integer, string or "
@@ -137,11 +198,14 @@ def warn_until(
     if _version_info_ is None:
         _version_info_ = salt.version.__version_info__
 
-    _version_ = salt.version.SaltStackVersion(*_version_info_)
+    # PERF: _version_info_ is normally immutable across the process
+    # lifetime, so this cache turns 300+ Version() allocations/sec
+    # observed under stress into a single one-time construction.
+    _version_ = _resolve_current_version(tuple(_version_info_))
 
     if _version_ >= version:
         caller = inspect.getframeinfo(sys._getframe(stacklevel - 1))
-        raise RuntimeError(
+        deprecated_message = (
             "The warning triggered on filename '{filename}', line number "
             "{lineno}, is supposed to be shown until version "
             "{until_version} is released. Current version is now "
@@ -150,10 +214,17 @@ def warn_until(
                 lineno=caller.lineno,
                 until_version=version.formatted_version,
                 salt_version=_version_.formatted_version,
-            ),
+            )
         )
+        if os.environ.get("RAISE_DEPRECATIONS_RUNTIME_ERRORS", "0") == "1":
+            # We don't raise RuntimeError by default since that can break
+            # users systems. We do however want to raise them in a CI context.
+            raise RuntimeError(deprecated_message)
+        # Otherwise, print the deprecated message to STDERR
+        sys.stderr.write(f"\n{deprecated_message}\n")
+        sys.stderr.flush()
 
-    if _dont_call_warnings is False:
+    if _dont_call_warnings is False and os.environ.get("PYTHONWARNINGS") != "ignore":
         warnings.warn(
             message.format(version=version.formatted_version),
             category,
@@ -206,10 +277,10 @@ def warn_until_date(
         # Attribute the warning to the calling function, not to warn_until_date()
         stacklevel = 2
 
-    today = _current_date or datetime.datetime.utcnow().date()
+    today = _current_date or datetime.datetime.now(datetime.timezone.utc).date()
     if today >= date:
         caller = inspect.getframeinfo(sys._getframe(stacklevel - 1))
-        raise RuntimeError(
+        deprecated_message = (
             "{message} This warning(now exception) triggered on "
             "filename '{filename}', line number {lineno}, is "
             "supposed to be shown until {date}. Today is {today}. "
@@ -221,8 +292,15 @@ def warn_until_date(
                 today=today.isoformat(),
             ),
         )
+        if os.environ.get("RAISE_DEPRECATIONS_RUNTIME_ERRORS", "0") == "1":
+            # We don't raise RuntimeError by default since that can break
+            # users systems. We do however want to raise them in a CI context.
+            raise RuntimeError(deprecated_message)
+        # Otherwise, print the deprecated message to STDERR
+        sys.stderr.write(f"\n{deprecated_message}\n")
+        sys.stderr.flush()
 
-    if _dont_call_warnings is False:
+    if _dont_call_warnings is False and os.environ.get("PYTHONWARNINGS") != "ignore":
         warnings.warn(
             message.format(date=date.isoformat(), today=today.isoformat()),
             category,
@@ -287,7 +365,7 @@ def kwargs_warn_until(
     _version_ = salt.version.SaltStackVersion(*_version_info_)
 
     if kwargs or _version_.info >= version.info:
-        arg_names = ", ".join("'{}'".format(key) for key in kwargs)
+        arg_names = ", ".join(f"'{key}'" for key in kwargs)
         warn_until(
             version,
             message=(
@@ -303,13 +381,16 @@ def kwargs_warn_until(
 
 def version_cmp(pkg1, pkg2, ignore_epoch=False):
     """
-    Compares two version strings using salt.utils.versions.LooseVersion. This
+    Compares two version strings using `LooseVersion`. This
     is a fallback for providers which don't have a version comparison utility
     built into them.  Return -1 if version1 < version2, 0 if version1 ==
     version2, and 1 if version1 > version2. Return None if there was a problem
     making the comparison.
     """
-    normalize = lambda x: str(x).split(":", 1)[-1] if ignore_epoch else str(x)
+
+    def normalize(x):
+        return str(x).split(":", 1)[-1] if ignore_epoch else str(x)
+
     pkg1 = normalize(pkg1)
     pkg2 = normalize(pkg2)
 
@@ -403,7 +484,7 @@ def check_boto_reqs(
             boto_ver = "2.0.0"
 
         if not has_boto or version_cmp(boto.__version__, boto_ver) == -1:
-            return False, "A minimum version of boto {} is required.".format(boto_ver)
+            return False, f"A minimum version of boto {boto_ver} is required."
 
     if check_boto3 is True:
         try:
@@ -425,12 +506,203 @@ def check_boto_reqs(
         if not has_boto3 or version_cmp(boto3.__version__, boto3_ver) == -1:
             return (
                 False,
-                "A minimum version of boto3 {} is required.".format(boto3_ver),
+                f"A minimum version of boto3 {boto3_ver} is required.",
             )
         elif version_cmp(botocore.__version__, botocore_ver) == -1:
             return (
                 False,
-                "A minimum version of botocore {} is required".format(botocore_ver),
+                f"A minimum version of botocore {botocore_ver} is required",
             )
 
     return True
+
+
+def parse(version):
+    """
+    A replacement for `pkg_resources.parse_version` which is being deprecated.
+    """
+    return packaging.version.parse(version)
+
+
+class RequirementNotRegistered(AttributeError):
+    pass
+
+
+Getters = collections.namedtuple("Getters", "module_getter, version_getter")
+
+
+def default_version_getter(module):
+    """
+    Module version getter.
+    """
+    ver = None
+    if hasattr(module, "__version__"):
+        ver = module.__version__
+    if hasattr(module, "version"):
+        ver = module.version
+    if ver is None:
+        raise Exception("Version info not found")
+    elif isinstance(ver, tuple):
+        return ".".join([str(_) for _ in ver])
+    else:
+        return ver
+
+
+def default_module_getter(name):
+    """
+    Module getter.
+    """
+    try:
+        return __import__(name)
+    except ImportError:
+        pass
+
+
+class Requirement:
+    def __init__(
+        self,
+        name,
+        module_getter=default_module_getter,
+        version_getter=default_version_getter,
+        has_depend=None,
+        version=None,
+    ):
+        self.name = name
+        self.module_getter = module_getter
+        self.version_getter = version_getter
+        self.has_depend = has_depend
+        self.version = version
+        self.populate()
+
+    @property
+    def module(self):
+        return self.module_getter(self.name)
+
+    def populate(self):
+        if self.has_depend is None:
+            mod = self.module_getter(self.name)
+            if mod:
+                self.has_depend = True
+                self.version = self.version_getter(mod)
+            else:
+                self.has_depend = False
+
+    def __nonzero__(self):
+        return self.has_depend
+
+    def __bool__(self):
+        return self.has_depend
+
+    def _get_version(self, ver):
+        if isinstance(ver, (list, tuple)):
+            return packaging.version.Version(".".join([str(_) for _ in ver]))
+        if isinstance(ver, packaging.version.Version):
+            return ver
+        return packaging.version.Version(str(ver))
+
+    def __eq__(self, other):
+        if not self.has_depend:
+            return False
+        other_ver = self._get_version(other)
+        dep_ver = self._get_version(self.version)
+        return dep_ver == other_ver
+
+    def __ne__(self, other):
+        if not self.has_depend:
+            return True
+        other_ver = self._get_version(other)
+        dep_ver = self._get_version(self.version)
+        return dep_ver != other_ver
+
+    def __lt__(self, other):
+        if not self.has_depend:
+            return False
+        other_ver = self._get_version(other)
+        dep_ver = self._get_version(self.version)
+        return dep_ver < other_ver
+
+    def __le__(self, other):
+        if not self.has_depend:
+            return False
+        other_ver = self._get_version(other)
+        dep_ver = self._get_version(self.version)
+        return dep_ver <= other_ver
+
+    def __gt__(self, other):
+        if not self.has_depend:
+            return False
+        other_ver = self._get_version(other)
+        dep_ver = self._get_version(self.version)
+        return dep_ver > other_ver
+
+    def __ge__(self, other):
+        if not self.has_depend:
+            return False
+        other_ver = self._get_version(other)
+        dep_ver = self._get_version(self.version)
+        return dep_ver >= other_ver
+
+
+def msgpack_module_getter(name):
+    """
+    Custom msgpack module getter
+    """
+    msgpack = None
+    try:
+        import msgpack
+
+        if msgpack.version >= (0, 4, 0):
+            if (
+                msgpack.loads(
+                    msgpack.dumps([1, 2, 3], use_bin_type=False), use_list=True
+                )
+                is None
+            ):
+                raise ImportError
+        else:
+            if msgpack.loads(msgpack.dumps([1, 2, 3]), use_list=True) is None:
+                raise ImportError
+    except ImportError:
+        try:
+            import msgpack_pure as msgpack  # pylint: disable=import-error
+        except ImportError:
+            return
+    return msgpack
+
+
+# To use a custom module or version getter for the depenency, map them here.
+DEPS_MAP = {
+    "msgpack": Getters(msgpack_module_getter, None),
+    "gnupg": Getters(None, None),
+}
+
+
+class Requirements:
+    def __init__(self, deps_map=None):
+        if deps_map is None:
+            self.deps_map = DEPS_MAP
+        else:
+            self.deps_map = deps_map
+        self._cached_reqs = {}
+
+    def clear(self):
+        """
+        Clear the cached requirements.
+        """
+        self._cached_reqs = {}
+
+    def __getattr__(self, val):
+        if val not in self.deps_map:
+            raise RequirementNotRegistered(f"Unknown dependency: {val}")
+
+        if val not in self._cached_reqs:
+            module_getter, version_getter = self.deps_map[val]
+            self._cached_reqs[val] = Requirement(
+                val,
+                module_getter or default_module_getter,
+                version_getter or default_version_getter,
+            )
+        return self._cached_reqs[val]
+
+
+reqs = Requirements()

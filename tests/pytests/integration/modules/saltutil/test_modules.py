@@ -2,7 +2,6 @@
 Integration tests for the saltutil module.
 """
 
-
 import pytest
 
 pytestmark = [
@@ -16,14 +15,14 @@ def refresh_pillar(salt_call_cli, salt_minion, salt_sub_minion):
         "modules": [],
     }
     ret = salt_call_cli.run("saltutil.sync_all", extmod_whitelist=whitelist)
-    assert ret.exitcode == 0
-    assert ret.json
+    assert ret.returncode == 0
+    assert ret.data
     try:
         yield
     finally:
         ret = salt_call_cli.run("saltutil.sync_all")
-        assert ret.exitcode == 0
-        assert ret.json
+        assert ret.returncode == 0
+        assert ret.data
 
 
 @pytest.mark.slow_test
@@ -41,7 +40,6 @@ def test_sync_all(salt_call_cli):
         "modules": [
             "modules.depends_versioned",
             "modules.depends_versionless",
-            "modules.mantest",
             "modules.override_test",
             "modules.runtests_decorators",
             "modules.runtests_helpers",
@@ -50,6 +48,7 @@ def test_sync_all(salt_call_cli):
         "renderers": [],
         "log_handlers": [],
         "matchers": [],
+        "resources": [],
         "states": [],
         "sdb": [],
         "proxymodules": [],
@@ -59,9 +58,9 @@ def test_sync_all(salt_call_cli):
         "serializers": [],
     }
     ret = salt_call_cli.run("saltutil.sync_all")
-    assert ret.exitcode == 0
-    assert ret.json
-    assert ret.json == expected_return
+    assert ret.returncode == 0
+    assert ret.data
+    assert ret.data == expected_return
 
 
 @pytest.mark.slow_test
@@ -80,6 +79,7 @@ def test_sync_all_whitelist(salt_call_cli):
         "renderers": [],
         "log_handlers": [],
         "matchers": [],
+        "resources": [],
         "states": [],
         "sdb": [],
         "proxymodules": [],
@@ -91,9 +91,9 @@ def test_sync_all_whitelist(salt_call_cli):
     ret = salt_call_cli.run(
         "saltutil.sync_all", extmod_whitelist={"modules": ["salttest"]}
     )
-    assert ret.exitcode == 0
-    assert ret.json
-    assert ret.json == expected_return
+    assert ret.returncode == 0
+    assert ret.data
+    assert ret.data == expected_return
 
 
 @pytest.mark.slow_test
@@ -109,7 +109,6 @@ def test_sync_all_blacklist(salt_call_cli):
         "utils": [],
         "returners": [],
         "modules": [
-            "modules.mantest",
             "modules.override_test",
             "modules.runtests_helpers",
             "modules.salttest",
@@ -117,6 +116,7 @@ def test_sync_all_blacklist(salt_call_cli):
         "renderers": [],
         "log_handlers": [],
         "matchers": [],
+        "resources": [],
         "states": [],
         "sdb": [],
         "proxymodules": [],
@@ -135,9 +135,9 @@ def test_sync_all_blacklist(salt_call_cli):
             ]
         },
     )
-    assert ret.exitcode == 0
-    assert ret.json
-    assert ret.json == expected_return
+    assert ret.returncode == 0
+    assert ret.data
+    assert ret.data == expected_return
 
 
 @pytest.mark.slow_test
@@ -157,6 +157,7 @@ def test_sync_all_blacklist_and_whitelist(salt_call_cli):
         "renderers": [],
         "log_handlers": [],
         "matchers": [],
+        "resources": [],
         "states": [],
         "sdb": [],
         "proxymodules": [],
@@ -169,6 +170,6 @@ def test_sync_all_blacklist_and_whitelist(salt_call_cli):
         extmod_whitelist={"modules": ["runtests_decorators"]},
         extmod_blacklist={"modules": ["runtests_decorators"]},
     )
-    assert ret.exitcode == 0
-    assert ret.json
-    assert ret.json == expected_return
+    assert ret.returncode == 0
+    assert ret.data
+    assert ret.data == expected_return
